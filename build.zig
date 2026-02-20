@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
 
     // Exe
     const exe = b.addExecutable(.{
-        .name = "zmx",
+        .name = "zmosh",
         .root_module = exe_mod,
     });
     exe.linkLibC();
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
     // As you can see we are re-defining the same executable but
     // we're binding it to a dedicated build step.
     const exe_check = b.addExecutable(.{
-        .name = "zmx",
+        .name = "zmosh",
         .root_module = exe_mod,
     });
     exe_check.linkLibC();
@@ -109,21 +109,21 @@ pub fn build(b: *std.Build) void {
         }
 
         const release_exe = b.addExecutable(.{
-            .name = "zmx",
+            .name = "zmosh",
             .root_module = release_mod,
         });
         release_exe.linkLibC();
 
         const os_name = @tagName(release_target.os_tag orelse .linux);
         const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
-        const tarball_name = b.fmt("zmx-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
+        const tarball_name = b.fmt("zmosh-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
 
         const tar = b.addSystemCommand(&.{ "tar", "--no-xattrs", "-czf" });
 
         const tarball = tar.addOutputFileArg(tarball_name);
         tar.addArg("-C");
         tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
-        tar.addArg("zmx");
+        tar.addArg("zmosh");
 
         const shasum = b.addSystemCommand(&.{ "shasum", "-a", "256" });
         shasum.addFileArg(tarball);

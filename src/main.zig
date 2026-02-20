@@ -543,7 +543,7 @@ fn printVersion(cfg: *Cfg) !void {
         ver = git_sha;
     }
     try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
+        "zmosh\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ ver, ghostty_version, cfg.socket_dir, cfg.log_dir },
     );
     try w.interface.flush();
@@ -559,9 +559,9 @@ fn printCompletions(shell: completions.Shell) !void {
 
 fn help() !void {
     const help_text =
-        \\zmx - session persistence for terminal processes
+        \\zmosh - session persistence for terminal processes
         \\
-        \\Usage: zmx <command> [args]
+        \\Usage: zmosh <command> [args]
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
@@ -769,7 +769,7 @@ fn detachAll(cfg: *Cfg) !void {
     const alloc = gpa.allocator();
     const session_name = std.process.getEnvVarOwned(alloc, "ZMX_SESSION") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
-            std.log.err("ZMX_SESSION env var not found: are you inside a zmx session?", .{});
+            std.log.err("ZMX_SESSION env var not found: are you inside a zmosh session?", .{});
             return;
         },
         else => return err,
