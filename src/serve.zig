@@ -177,27 +177,11 @@ pub const Gateway = struct {
                     break;
                 }
 
-                // Forward each complete IPC message as an encrypted UDP datagram
+                // Forward each complete IPC message as encrypted UDP datagrams.
+                // Large Output messages are chunked to stay under the network MTU
+                // and avoid IP fragmentation (which causes silent packet loss).
                 while (self.unix_read_buf.next()) |msg| {
-                    // Reconstruct the raw IPC bytes (header + payload)
-                    const header = ipc.Header{ .tag = msg.header.tag, .len = @intCast(msg.payload.len) };
-                    var ipc_bytes = try std.ArrayList(u8).initCapacity(self.alloc, @sizeOf(ipc.Header) + msg.payload.len);
-                    defer ipc_bytes.deinit(self.alloc);
-                    try ipc_bytes.appendSlice(self.alloc, std.mem.asBytes(&header));
-                    if (msg.payload.len > 0) {
-                        try ipc_bytes.appendSlice(self.alloc, msg.payload);
-                    }
-
-                    self.peer.send(&self.udp_sock, ipc_bytes.items) catch |err| {
-                        if (err == error.NoPeerAddress) {
-                            // No client connected yet — drop the message
-                            log.debug("no peer address, dropping IPC message tag={d}", .{@intFromEnum(msg.header.tag)});
-                        } else if (err == error.WouldBlock) {
-                            log.debug("udp send would block", .{});
-                        } else {
-                            log.warn("udp send error: {s}", .{@errorName(err)});
-                        }
-                    };
+                    self.forwardToUdp(msg.header.tag, msg.payload);
                 }
             }
 
@@ -229,6 +213,43 @@ pub const Gateway = struct {
                 log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    // Max IPC payload per UDP datagram to avoid IP fragmentation.
+    // 1472 (Ethernet MTU minus IP+UDP headers) - 24 (crypto) - 5 (IPC header) = 1443.
+    // Use 1200 to leave headroom for tunnels/VPNs.
+    const max_chunk = 1200 - crypto.overhead - @sizeOf(ipc.Header);
+
+    fn forwardToUdp(self: *Gateway, tag: ipc.Tag, payload: []const u8) void {
+        if (tag == .Output and payload.len > max_chunk) {
+            // Split large Output into MTU-safe chunks
+            var off: usize = 0;
+            while (off < payload.len) {
+                const end = @min(off + max_chunk, payload.len);
+                self.sendIpcDatagram(.Output, payload[off..end]);
+                off = end;
+            }
+        } else {
+            self.sendIpcDatagram(tag, payload);
+        }
+    }
+
+    fn sendIpcDatagram(self: *Gateway, tag: ipc.Tag, payload: []const u8) void {
+        var buf: [1200]u8 = undefined;
+        const hdr = ipc.Header{ .tag = tag, .len = @intCast(payload.len) };
+        @memcpy(buf[0..@sizeOf(ipc.Header)], std.mem.asBytes(&hdr));
+        if (payload.len > 0) {
+            @memcpy(buf[@sizeOf(ipc.Header)..][0..payload.len], payload);
+        }
+        self.peer.send(&self.udp_sock, buf[0 .. @sizeOf(ipc.Header) + payload.len]) catch |err| {
+            if (err == error.NoPeerAddress) {
+                log.debug("no peer address, dropping IPC tag={d}", .{@intFromEnum(tag)});
+            } else if (err == error.WouldBlock) {
+                log.debug("udp send would block", .{});
+            } else {
+                log.warn("udp send error: {s}", .{@errorName(err)});
+            }
+        };
     }
 
     pub fn deinit(self: *Gateway) void {
