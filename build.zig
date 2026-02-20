@@ -298,7 +298,7 @@ fn addXCFrameworkCommand(b: *std.Build, output_path: []const u8, slices: []const
             \\    <key>CFBundleVersion</key>
             \\    <string>1</string>
             \\    <key>MinimumOSVersion</key>
-            \\    <string>15.0</string>
+            \\    <string>17.0</string>
             \\</dict>
             \\</plist>
             \\PLIST
