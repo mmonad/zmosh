@@ -1,47 +1,33 @@
-# zmx
+# zmx Agent Guidelines
 
-The goal of this project is to create a way to attach and detach terminal sessions without killing the underlying linux process.
+## Design Principles
 
-When researching `zmx`, also read the @README.md in the root of this project directory to learn more about the features, documentation, prior art, etc.
+1. **Simple yet robust** — Favor the simplest solution that handles failure gracefully. No over-engineering. If three lines of code work, don't build an abstraction.
+2. **Idiomatic Zig** — Explicit over implicit. Comptime over runtime. Errors as values. No hidden control flow. Use the allocator pattern. Prefer `poll()` over threads.
+3. **Don't reinvent the wheel** — Use Zig's standard library (`std.crypto`, `std.posix`, `std.net`) before writing custom code. If `std` solves the problem, use it.
+4. **No unnecessary duplication** — Before writing new code, check if equivalent functionality already exists in the codebase. One source of truth for each concern.
+5. **Zero external dependencies where possible** — zmx currently has one external dep (`ghostty-vt`). Keep it minimal. Prefer `std.crypto.aead.xchacha20poly1305` over pulling in a C crypto library.
+6. **Gateway architecture for network layer** — Network/crypto code lives in separate modules (`crypto.zig`, `udp.zig`, `serve.zig`). The daemon and its Unix socket IPC remain untouched. The `zmx serve` gateway bridges UDP to the existing protocol.
 
-## tech stack
+## Architecture
 
-- `zig` v0.15.1
-- `libghostty-vt` for terminal escape codes and terminal state management
+- **Single binary** — `zmx` serves as client, daemon, and gateway
+- **Daemon-per-session** — Each session is an independent forked process
+- **Event loop** — Single-threaded `poll()`, no threads
+- **IPC** — Length-prefixed binary framing over Unix domain sockets (see `src/ipc.zig`)
+- **Terminal state** — `ghostty_vt.Terminal` maintains full VT emulator with scrollback server-side
+- **Re-attach** — `serializeTerminalState()` sends complete terminal snapshot on reconnect
 
-## commands
+## Commands
 
-- **Build:** `zig build`
-- **Build Check (Zig)**: `zig build check`
-- **Test (Zig):** `zig build test`
-- **Test filter (Zig)**: `zig build test -Dtest-filter=<test name>`
-- **Formatting (Zig)**: `zig fmt .`
+- **Build**: `zig build`
+- **Test**: `zig build test`
+- **Type check**: `zig build check`
+- **Release**: `zig build release`
 
-## find any library API definitions
+## What Not To Do
 
-Before trying anything else, run the `zigdoc` command to find an API with documentation:
-
-```
-zigdoc {symbol}
-# examples
-zigdoc ghostty-vt
-zigdoc std.ArrayList
-zigdoc std.mem.Allocator
-zigdoc std.http.Server
-```
-
-Only if that doesn't work should you grep the project dir.
-
-## find zig std library source code
-
-To inspect the source code for zig's standard library, look inside the `zig_std_src` folder.
-
-## find ghostty library source code
-
-To inspect the source code for zig's standard library, look inside the `ghostty_src` folder.
-
-## Issue Tracking
-
-We use bd (beads, https://github.com/steveyegge/beads) for issue tracking instead of Markdown TODOs or external tools.
-
-Run `bd quickstart` to learn how to use it.
+- Don't modify the daemon's core event loop or IPC protocol for network features — use the gateway pattern
+- Don't add threads — the `poll()` loop is simple and correct
+- Don't add external C dependencies — use Zig's stdlib
+- Don't break the existing Unix socket path — local sessions must keep working unchanged
