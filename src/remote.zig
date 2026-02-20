@@ -62,6 +62,7 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
     defer alloc.free(remote_cmd);
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
     var child = std.process.Child.init(&argv, alloc);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
     try child.spawn();
@@ -94,9 +95,13 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         return error.InvalidConnectLine;
     };
 
-    // Close our end of the stdout pipe — we have the connect info.
+    // Close our end of the pipes — we have the connect info.
     // Don't wait for SSH to exit: the remote gateway runs indefinitely.
     // SSH will be killed when we exit or will linger harmlessly.
+    if (child.stdin) |f| {
+        f.close();
+        child.stdin = null;
+    }
     if (child.stdout) |f| {
         f.close();
         child.stdout = null;
@@ -199,6 +204,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     defer stdout_buf.deinit(alloc);
     var was_disconnected = false;
+    var session_ended = false;
 
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
@@ -290,6 +296,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
                         if (hdr.tag == .Output and payload.len > 0) {
                             try stdout_buf.appendSlice(alloc, payload);
+                        } else if (hdr.tag == .SessionEnd) {
+                            session_ended = true;
                         }
                         offset += msg_len;
                     }
@@ -308,6 +316,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                     try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
                 }
             }
+        }
+
+        if (session_ended) {
+            // Flush any remaining output before exiting
+            if (stdout_buf.items.len > 0) {
+                _ = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch {};
+            }
+            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: remote session ended\r\n") catch {};
+            return;
         }
     }
 }
