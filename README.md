@@ -467,4 +467,5 @@ The UDP auto-reconnect design draws from:
 
 ## community tools
 
+- [zsm](https://github.com/mdsakalu/zmx-session-manager) — TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zig-skills](https://github.com/rudedogg/zig-skills) — Claude Code skill for up-to-date Zig 0.15.x patterns. Powers this project's AI-assisted development, avoiding outdated patterns from training data.
