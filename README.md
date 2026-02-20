@@ -6,6 +6,8 @@
 <p align="center">
   Session persistence with auto-reconnect for terminal processes.
   <br />
+  CLI + C library (macOS, iOS, Linux)
+  <br />
   Built on <a href="https://github.com/neurosnap/zmx">zmx</a> · Powered by <a href="https://github.com/ghostty-org/ghostty">libghostty-vt</a>
 </p>
 
@@ -67,6 +69,55 @@ Locally, zmosh **is** zmx. Every local feature works identically. The new capabi
 ```bash
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 # be sure to add ~/.local/bin to your PATH
+```
+
+### build targets
+
+| Command | Output | Description |
+| --- | --- | --- |
+| `zig build` | `zmosh` binary | Build for host platform |
+| `zig build test` | — | Run unit tests |
+| `zig build check` | — | Type-check only (used by ZLS build-on-save) |
+| `zig build release` | `zig-out/dist/*.tar.gz` | Release tarballs (macOS builds all platforms, Linux builds Linux only) |
+| `zig build lib` | `libzmosh.a` + headers | Static C library for host platform |
+| `zig build macos-lib` | `libzmosh-macos.a` | Static library for macOS aarch64 (requires macOS) |
+| `zig build ios-lib` | `zmosh-ios.xcframework` | XCFramework for iOS device + simulator (requires macOS) |
+| `zig build xcframework` | `zmosh.xcframework` | XCFramework with all Apple slices: macOS + iOS + iOS simulator (requires macOS) |
+
+### libzmosh (C library)
+
+zmosh exposes a C API (`include/zmosh.h`) for embedding the remote session client into native apps. The API is callback-driven and designed for event loop integration:
+
+```c
+// Connect to a remote zmosh gateway
+zmosh_session_t *session = zmosh_connect(
+    host, port, key_base64,
+    rows, cols,
+    output_cb,   // called with terminal output bytes
+    state_cb,    // called on connection state changes (may be NULL)
+    end_cb,      // called when session ends (may be NULL)
+    ctx, &status
+);
+
+// Integrate with your event loop (GCD, kqueue, poll, etc.)
+int fd = zmosh_get_fd(session);
+
+// Call when fd is readable, or periodically for heartbeats
+zmosh_poll(session);
+
+// Send terminal input and resize events
+zmosh_send_input(session, data, len);
+zmosh_resize(session, rows, cols);
+
+// Cleanup
+zmosh_disconnect(session);
+```
+
+To build the XCFramework for an iOS/macOS app (must be run on macOS):
+
+```bash
+zig build xcframework
+# produces zig-out/zmosh.xcframework — drag into Xcode
 ```
 
 ## usage
