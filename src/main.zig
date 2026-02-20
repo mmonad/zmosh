@@ -6,6 +6,8 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
+const serve_mod = @import("serve.zig");
+const remote = @import("remote.zig");
 
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
@@ -393,14 +395,34 @@ pub fn main() !void {
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
+        var session_name: []const u8 = "";
+        var remote_host: ?[]const u8 = null;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
-            try command_args.append(alloc, arg);
+            if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
+                remote_host = args.next();
+            } else if (session_name.len == 0) {
+                session_name = arg;
+            } else {
+                try command_args.append(alloc, arg);
+            }
         }
 
+        const sesh = try getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        // Remote attach via encrypted UDP
+        if (remote_host) |host| {
+            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+                std.log.err("remote connect failed: {s}", .{@errorName(err)});
+                return;
+            };
+            return remote.remoteAttach(alloc, session);
+        }
+
+        // Local attach (existing behavior)
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
         var command: ?[][]const u8 = null;
         if (command_args.items.len > 0) {
@@ -410,8 +432,6 @@ pub fn main() !void {
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "";
 
-        const sesh = try getSeshName(alloc, session_name);
-        defer alloc.free(sesh);
         var daemon = Daemon{
             .running = true,
             .cfg = &cfg,
@@ -427,6 +447,32 @@ pub fn main() !void {
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
+    } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
+        const session_name = args.next() orelse "";
+        const sesh = try getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        // Ensure the session daemon exists (create if needed), same as attach
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = &cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = sesh,
+            .socket_path = undefined,
+            .pid = undefined,
+            .command = null,
+            .cwd = cwd,
+            .created_at = @intCast(std.time.nanoTimestamp()),
+        };
+        daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
+        const result = try ensureSession(&daemon);
+        if (result.is_daemon) return; // we are the forked daemon child
+
+        return serve_mod.serveMain(alloc, sesh);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
 
@@ -519,7 +565,9 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
+        \\  [a]ttach -r <host> <name>      Attach to remote session via UDP
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
+        \\  [s]erve <name>                 Start UDP gateway for remote access
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
