@@ -54,11 +54,20 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
 pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
-    const remote_cmd = try std.fmt.allocPrint(
-        alloc,
-        "PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
-        .{session},
-    );
+    const term = posix.getenv("TERM") orelse "xterm-256color";
+    const colorterm = posix.getenv("COLORTERM");
+    const remote_cmd = if (colorterm) |ct|
+        try std.fmt.allocPrint(
+            alloc,
+            "TERM={s} COLORTERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
+            .{ term, ct, session },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "TERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
+            .{ term, session },
+        );
     defer alloc.free(remote_cmd);
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
     var child = std.process.Child.init(&argv, alloc);
