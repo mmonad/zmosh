@@ -1,4 +1,0 @@
-module zmosh {
-    header "zmosh.h"
-    export *
-}

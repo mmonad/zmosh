@@ -162,11 +162,9 @@ pub fn build(b: *std.Build) void {
         });
         lib.bundle_compiler_rt = true;
         const install_lib = b.addInstallArtifact(lib, .{});
-        const install_header = b.addInstallFile(b.path("include/zmosh.h"), "include/zmosh.h");
-        const install_modulemap = b.addInstallFile(b.path("include/module.modulemap"), "include/module.modulemap");
+        const install_header = b.addInstallFile(b.path("include/zmosh/zmosh.h"), "include/zmosh/zmosh.h");
         lib_step.dependOn(&install_lib.step);
         lib_step.dependOn(&install_header.step);
-        lib_step.dependOn(&install_modulemap.step);
     }
 
     // Apple library targets (macOS only)
@@ -240,19 +238,80 @@ const LibSlice = struct {
     name: []const u8,
 };
 
-/// Create an xcodebuild -create-xcframework command from library slices.
+/// Assemble a .framework bundle from a static library and headers,
+/// then create an xcframework using -framework (not -library).
+/// This ensures headers stay isolated inside each framework bundle and
+/// don't leak into other modules' header search paths.
 fn addXCFrameworkCommand(b: *std.Build, output_path: []const u8, slices: []const LibSlice) *std.Build.Step.Run {
     // rm -rf old framework first
     const rm = b.addSystemCommand(&.{ "rm", "-rf", output_path });
 
     const xcf = b.addSystemCommand(&.{"xcodebuild"});
     xcf.addArgs(&.{"-create-xcframework"});
+
     for (slices) |slice| {
-        xcf.addArg("-library");
-        xcf.addFileArg(slice.lib.getEmittedBin());
-        xcf.addArg("-headers");
-        xcf.addDirectoryArg(b.path("include"));
+        // Create a .framework bundle directory for each slice:
+        //   zmosh.framework/
+        //     zmosh          (the static library binary)
+        //     Headers/
+        //       zmosh.h
+        //     Info.plist
+        const fw_dir = b.fmt("zig-out/fw-{s}/zmosh.framework", .{slice.name});
+
+        // Clean and create the framework directory structure
+        const mkdir = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+            "rm -rf zig-out/fw-{s} && mkdir -p {s}/Headers",
+            .{ slice.name, fw_dir },
+        ) });
+
+        // Copy the static library as the framework binary
+        const cp_lib = b.addSystemCommand(&.{"cp"});
+        cp_lib.addFileArg(slice.lib.getEmittedBin());
+        cp_lib.addArg(b.fmt("{s}/zmosh", .{fw_dir}));
+        cp_lib.step.dependOn(&mkdir.step);
+
+        // Copy headers (flatten: zmosh/zmosh.h → zmosh.h)
+        const cp_hdr = b.addSystemCommand(&.{ "cp", "include/zmosh/zmosh.h", b.fmt("{s}/Headers/zmosh.h", .{fw_dir}) });
+        cp_hdr.step.dependOn(&mkdir.step);
+
+        // Write framework Info.plist
+        const write_plist = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
+            \\cat > {s}/Info.plist << 'PLIST'
+            \\<?xml version="1.0" encoding="UTF-8"?>
+            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            \\<plist version="1.0">
+            \\<dict>
+            \\    <key>CFBundleDevelopmentRegion</key>
+            \\    <string>en</string>
+            \\    <key>CFBundleExecutable</key>
+            \\    <string>zmosh</string>
+            \\    <key>CFBundleIdentifier</key>
+            \\    <string>com.mmonad.zmosh</string>
+            \\    <key>CFBundleInfoDictionaryVersion</key>
+            \\    <string>6.0</string>
+            \\    <key>CFBundleName</key>
+            \\    <string>zmosh</string>
+            \\    <key>CFBundlePackageType</key>
+            \\    <string>FMWK</string>
+            \\    <key>CFBundleShortVersionString</key>
+            \\    <string>0.1.0</string>
+            \\    <key>CFBundleVersion</key>
+            \\    <string>1</string>
+            \\    <key>MinimumOSVersion</key>
+            \\    <string>15.0</string>
+            \\</dict>
+            \\</plist>
+            \\PLIST
+        , .{fw_dir}) });
+        write_plist.step.dependOn(&mkdir.step);
+
+        xcf.addArg("-framework");
+        xcf.addArg(fw_dir);
+        xcf.step.dependOn(&cp_lib.step);
+        xcf.step.dependOn(&cp_hdr.step);
+        xcf.step.dependOn(&write_plist.step);
     }
+
     xcf.addArgs(&.{ "-output", output_path });
     xcf.step.dependOn(&rm.step);
     return xcf;
