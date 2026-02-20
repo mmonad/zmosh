@@ -60,6 +60,21 @@ Locally, zmosh **is** zmx. Every local feature works identically. The new capabi
 
 ## install
 
+### homebrew
+
+```bash
+brew tap mmonad/zmosh
+brew install zmosh
+```
+
+### arch linux (aur)
+
+```bash
+yay -S zmosh-git
+# or
+paru -S zmosh-git
+```
+
 ### src
 
 - Requires zig `v0.15`
