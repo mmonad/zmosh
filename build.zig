@@ -143,4 +143,117 @@ pub fn build(b: *std.Build) void {
 
     upload_step.dependOn(&rsync_docs.step);
     upload_step.dependOn(&rsync_dist.step);
+
+    // -----------------------------------------------------------------------
+    // Library targets (libzmosh)
+    // -----------------------------------------------------------------------
+
+    // `zig build lib` — static library for the host target (dev/testing)
+    {
+        const lib_step = b.step("lib", "Build libzmosh static library for host");
+        const lib_mod = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const lib = b.addLibrary(.{
+            .name = "zmosh",
+            .root_module = lib_mod,
+        });
+        lib.bundle_compiler_rt = true;
+        const install_lib = b.addInstallArtifact(lib, .{});
+        const install_header = b.addInstallFile(b.path("include/zmosh.h"), "include/zmosh.h");
+        const install_modulemap = b.addInstallFile(b.path("include/module.modulemap"), "include/module.modulemap");
+        lib_step.dependOn(&install_lib.step);
+        lib_step.dependOn(&install_header.step);
+        lib_step.dependOn(&install_modulemap.step);
+    }
+
+    // Apple library targets (macOS only)
+    if (native_os == .macos) {
+        const macos_lib_step = b.step("macos-lib", "Build libzmosh.a for macOS (aarch64)");
+        const ios_lib_step = b.step("ios-lib", "Build libzmosh.a for iOS + simulator (aarch64)");
+        const xcf_step = b.step("xcframework", "Build zmosh.xcframework (macOS + iOS)");
+
+        // macOS aarch64
+        const macos_lib = addLibTarget(b, .{
+            .cpu_arch = .aarch64,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+        });
+        const install_macos = b.addInstallFile(macos_lib.getEmittedBin(), "lib/libzmosh-macos.a");
+        macos_lib_step.dependOn(&install_macos.step);
+
+        // iOS device aarch64
+        const ios_lib = addLibTarget(b, .{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .os_version_min = .{ .semver = .{ .major = 15, .minor = 0, .patch = 0 } },
+        });
+
+        // iOS simulator aarch64 — pin CPU to apple_a17 to work around Zig bug
+        // where the generic CPU model emits unsupported instructions for simulator.
+        var sim_query: std.Target.Query = .{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .abi = .simulator,
+            .os_version_min = .{ .semver = .{ .major = 15, .minor = 0, .patch = 0 } },
+        };
+        sim_query.cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a17 };
+        const sim_lib = addLibTarget(b, sim_query);
+
+        // ios-lib: xcodebuild -create-xcframework with device + simulator
+        const ios_xcf = addXCFrameworkCommand(b, "zig-out/zmosh-ios.xcframework", &.{
+            .{ .lib = ios_lib, .name = "ios-arm64" },
+            .{ .lib = sim_lib, .name = "ios-arm64_simulator" },
+        });
+        ios_lib_step.dependOn(&ios_xcf.step);
+
+        // xcframework: all three slices (macOS + iOS device + iOS simulator)
+        const full_xcf = addXCFrameworkCommand(b, "zig-out/zmosh.xcframework", &.{
+            .{ .lib = macos_lib, .name = "macos-arm64" },
+            .{ .lib = ios_lib, .name = "ios-arm64" },
+            .{ .lib = sim_lib, .name = "ios-arm64_simulator" },
+        });
+        xcf_step.dependOn(&full_xcf.step);
+    }
+}
+
+/// Create a static library target for lib.zig with the given target query.
+fn addLibTarget(b: *std.Build, query: std.Target.Query) *std.Build.Step.Compile {
+    const resolved = b.resolveTargetQuery(query);
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = resolved,
+        .optimize = .ReleaseSafe,
+    });
+    const lib = b.addLibrary(.{
+        .name = "zmosh",
+        .root_module = mod,
+    });
+    lib.bundle_compiler_rt = true;
+    return lib;
+}
+
+const LibSlice = struct {
+    lib: *std.Build.Step.Compile,
+    name: []const u8,
+};
+
+/// Create an xcodebuild -create-xcframework command from library slices.
+fn addXCFrameworkCommand(b: *std.Build, output_path: []const u8, slices: []const LibSlice) *std.Build.Step.Run {
+    // rm -rf old framework first
+    const rm = b.addSystemCommand(&.{ "rm", "-rf", output_path });
+
+    const xcf = b.addSystemCommand(&.{"xcodebuild"});
+    xcf.addArgs(&.{"-create-xcframework"});
+    for (slices) |slice| {
+        xcf.addArg("-library");
+        xcf.addFileArg(slice.lib.getEmittedBin());
+        xcf.addArg("-headers");
+        xcf.addDirectoryArg(b.path("include"));
+    }
+    xcf.addArgs(&.{ "-output", output_path });
+    xcf.step.dependOn(&rm.step);
+    return xcf;
 }
