@@ -221,6 +221,14 @@ pub const Gateway = struct {
                 break;
             }
         }
+
+        // Notify client that the session has ended
+        if (self.peer.addr != null) {
+            const header = ipc.Header{ .tag = .SessionEnd, .len = 0 };
+            self.peer.send(&self.udp_sock, std.mem.asBytes(&header)) catch |err| {
+                log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn deinit(self: *Gateway) void {
