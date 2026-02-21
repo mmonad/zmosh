@@ -13,6 +13,9 @@ const macos_targets: []const std.Target.Query = &.{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const enable_msquic = b.option(bool, "enable_msquic", "Enable experimental QUIC transport via MsQuic C API") orelse false;
+    const msquic_include_dir = b.option([]const u8, "msquic_include_dir", "Path to directory containing msquic.h");
+    const msquic_lib_dir = b.option([]const u8, "msquic_lib_dir", "Path to directory containing libmsquic");
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, @import("build.zig.zon").version);
 
@@ -30,12 +33,14 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_sha", git_sha);
     options.addOption([]const u8, "ghostty_version", @import("build.zig.zon").dependencies.ghostty.hash);
+    options.addOption(bool, "enable_msquic", enable_msquic);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    configureMsquicModule(exe_mod, msquic_include_dir);
     exe_mod.addOptions("build_options", options);
 
     // You'll want to use a lazy dependency here so that ghostty is only
@@ -55,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .name = "zmosh",
         .root_module = exe_mod,
     });
+    configureMsquicLink(exe, enable_msquic, msquic_lib_dir);
     exe.linkLibC();
 
     b.installArtifact(exe);
@@ -69,6 +75,7 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    configureMsquicLink(exe_unit_tests, enable_msquic, msquic_lib_dir);
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
 
@@ -79,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .name = "zmosh",
         .root_module = exe_mod,
     });
+    configureMsquicLink(exe_check, enable_msquic, msquic_lib_dir);
     exe_check.linkLibC();
     // There is no `b.installArtifact(exe_check);` here.
 
@@ -99,6 +107,7 @@ pub fn build(b: *std.Build) void {
             .target = resolved,
             .optimize = .ReleaseSafe,
         });
+        configureMsquicModule(release_mod, msquic_include_dir);
         release_mod.addOptions("build_options", options);
 
         if (b.lazyDependency("ghostty", .{
@@ -112,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .name = "zmosh",
             .root_module = release_mod,
         });
+        configureMsquicLink(release_exe, enable_msquic, msquic_lib_dir);
         release_exe.linkLibC();
 
         const os_name = @tagName(release_target.os_tag orelse .linux);
@@ -217,6 +227,21 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+fn configureMsquicModule(mod: *std.Build.Module, include_dir: ?[]const u8) void {
+    if (include_dir) |dir| {
+        mod.addIncludePath(.{ .cwd_relative = dir });
+    }
+}
+
+fn configureMsquicLink(step: *std.Build.Step.Compile, enable: bool, lib_dir: ?[]const u8) void {
+    if (!enable) return;
+    if (lib_dir) |dir| {
+        step.addLibraryPath(.{ .cwd_relative = dir });
+        step.addRPath(.{ .cwd_relative = dir });
+    }
+    step.linkSystemLibrary("msquic");
+}
+
 /// Create a static library target for lib.zig with the given target query.
 fn addLibTarget(b: *std.Build, query: std.Target.Query) *std.Build.Step.Compile {
     const resolved = b.resolveTargetQuery(query);
@@ -275,34 +300,36 @@ fn addXCFrameworkCommand(b: *std.Build, output_path: []const u8, slices: []const
         cp_hdr.step.dependOn(&mkdir.step);
 
         // Write framework Info.plist
-        const write_plist = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-            \\cat > {s}/Info.plist << 'PLIST'
-            \\<?xml version="1.0" encoding="UTF-8"?>
-            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            \\<plist version="1.0">
-            \\<dict>
-            \\    <key>CFBundleDevelopmentRegion</key>
-            \\    <string>en</string>
-            \\    <key>CFBundleExecutable</key>
-            \\    <string>zmosh</string>
-            \\    <key>CFBundleIdentifier</key>
-            \\    <string>com.mmonad.zmosh</string>
-            \\    <key>CFBundleInfoDictionaryVersion</key>
-            \\    <string>6.0</string>
-            \\    <key>CFBundleName</key>
-            \\    <string>zmosh</string>
-            \\    <key>CFBundlePackageType</key>
-            \\    <string>FMWK</string>
-            \\    <key>CFBundleShortVersionString</key>
-            \\    <string>0.1.0</string>
-            \\    <key>CFBundleVersion</key>
-            \\    <string>1</string>
-            \\    <key>MinimumOSVersion</key>
-            \\    <string>17.0</string>
-            \\</dict>
-            \\</plist>
-            \\PLIST
-        , .{fw_dir}) });
+        const write_plist = b.addSystemCommand(&.{
+            "sh", "-c", b.fmt(
+                \\cat > {s}/Info.plist << 'PLIST'
+                \\<?xml version="1.0" encoding="UTF-8"?>
+                \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                \\<plist version="1.0">
+                \\<dict>
+                \\    <key>CFBundleDevelopmentRegion</key>
+                \\    <string>en</string>
+                \\    <key>CFBundleExecutable</key>
+                \\    <string>zmosh</string>
+                \\    <key>CFBundleIdentifier</key>
+                \\    <string>com.mmonad.zmosh</string>
+                \\    <key>CFBundleInfoDictionaryVersion</key>
+                \\    <string>6.0</string>
+                \\    <key>CFBundleName</key>
+                \\    <string>zmosh</string>
+                \\    <key>CFBundlePackageType</key>
+                \\    <string>FMWK</string>
+                \\    <key>CFBundleShortVersionString</key>
+                \\    <string>0.1.0</string>
+                \\    <key>CFBundleVersion</key>
+                \\    <string>1</string>
+                \\    <key>MinimumOSVersion</key>
+                \\    <string>17.0</string>
+                \\</dict>
+                \\</plist>
+                \\PLIST
+            , .{fw_dir}),
+        });
         write_plist.step.dependOn(&mkdir.step);
 
         xcf.addArg("-framework");

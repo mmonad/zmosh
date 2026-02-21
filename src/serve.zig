@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
+const msquic = @import("msquic.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
 
@@ -271,9 +272,11 @@ pub fn serveMainWithTransport(
     session_name: []const u8,
     kind: transport.Kind,
 ) !void {
-    if (kind != .udp) {
-        log.err("QUIC transport is experimental and not implemented yet", .{});
-        return error.TransportNotImplemented;
+    if (kind == .quic) {
+        return msquic.serveMainQuic(alloc, session_name, .{
+            .port_range_start = (udp.Config{}).port_range_start,
+            .port_range_end = (udp.Config{}).port_range_end,
+        });
     }
 
     var gw = try Gateway.init(alloc, session_name, .{});

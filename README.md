@@ -184,6 +184,9 @@ zmosh attach -r myserver dev
 # explicit transport (udp is the default)
 zmosh attach -r myserver --transport udp dev
 
+# experimental QUIC transport (requires msquic-enabled build)
+zmosh attach -r myserver --transport quic dev
+
 # short form
 zmosh a -r myserver dev
 
@@ -193,11 +196,23 @@ zmosh a -r build-box build make -j16
 
 The remote workflow:
 1. zmosh SSHs into `<host>` and runs `zmosh serve <session>`
-2. The remote gateway binds a UDP port and prints a connect line with the session key
-3. zmosh reads the key, closes the SSH pipes, and switches to encrypted UDP
+2. The remote gateway binds a transport port and prints a connect line with the session key
+3. zmosh reads the key, closes the SSH pipes, and switches to the selected transport (`udp` or `quic`)
 4. If your network drops, the client shows a status bar and reconnects automatically when connectivity returns
 
-`--transport quic` is reserved as an experimental path and currently returns a `TransportNotImplemented` error.
+`--transport quic` uses the MsQuic C library directly and is experimental.
+To enable it at build-time:
+
+```bash
+zig build -Denable_msquic=true \
+  -Dmsquic_include_dir=/path/to/msquic/src/inc \
+  -Dmsquic_lib_dir=/path/to/msquic/lib
+```
+
+When running `zmosh serve --transport quic`, the server side also requires:
+
+- `ZMOSH_QUIC_CERT_FILE` - path to TLS certificate file
+- `ZMOSH_QUIC_KEY_FILE` - path to TLS private key file
 
 ## shell prompt
 

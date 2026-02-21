@@ -632,6 +632,8 @@ fn help() !void {
         \\  - TMPDIR               Controls which folder is used to store unix socket files (prio: 3)
         \\  - ZMX_SESSION          This variable is injected into every zmx session automatically
         \\  - ZMX_SESSION_PREFIX   Adds this value to the start of every session name for all commands
+        \\  - ZMOSH_QUIC_CERT_FILE TLS cert path for `serve --transport quic` (experimental)
+        \\  - ZMOSH_QUIC_KEY_FILE  TLS key path for `serve --transport quic` (experimental)
         \\
     ;
     var buf: [4096]u8 = undefined;

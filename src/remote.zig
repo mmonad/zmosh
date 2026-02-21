@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
+const msquic = @import("msquic.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
 const builtin = @import("builtin");
@@ -175,10 +176,11 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     switch (session.transport) {
         .udp => return remoteAttachUdp(alloc, session),
-        .quic => {
-            log.err("QUIC transport is experimental and not implemented yet", .{});
-            return error.TransportNotImplemented;
-        },
+        .quic => return msquic.remoteAttachQuic(alloc, .{
+            .host = session.host,
+            .port = session.port,
+            .key = session.key,
+        }),
     }
 }
 
