@@ -294,8 +294,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     raw_termios.c_cc[c.VTIME] = 0;
     _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &raw_termios);
 
-    // Clear screen
-    _ = try posix.write(posix.STDOUT_FILENO, "\x1b[2J\x1b[H");
+    // Enter alternate screen before attach so detach returns to the exact
+    // outer shell display state.
+    _ = try posix.write(posix.STDOUT_FILENO, "\x1b[?1049h\x1b[2J\x1b[H");
 
     setupSigwinchHandler();
 
