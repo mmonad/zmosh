@@ -3,6 +3,7 @@ const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
+const transport = @import("transport.zig");
 
 const log = std.log.scoped(.serve);
 
@@ -262,6 +263,19 @@ pub const Gateway = struct {
 
 /// Entry point for `zmx serve <session>`.
 pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    return serveMainWithTransport(alloc, session_name, .udp);
+}
+
+pub fn serveMainWithTransport(
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    kind: transport.Kind,
+) !void {
+    if (kind != .udp) {
+        log.err("QUIC transport is experimental and not implemented yet", .{});
+        return error.TransportNotImplemented;
+    }
+
     var gw = try Gateway.init(alloc, session_name, .{});
     defer gw.deinit();
     try gw.run();

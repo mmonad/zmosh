@@ -8,6 +8,7 @@ const log = @import("log.zig");
 const completions = @import("completions.zig");
 const serve_mod = @import("serve.zig");
 const remote = @import("remote.zig");
+const transport = @import("transport.zig");
 
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
@@ -397,12 +398,28 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var session_name: []const u8 = "";
         var remote_host: ?[]const u8 = null;
+        var remote_transport: transport.Kind = .udp;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
                 remote_host = args.next();
+            } else if (std.mem.eql(u8, arg, "--transport")) {
+                const val = args.next() orelse {
+                    std.log.err("missing value for --transport (expected udp or quic)", .{});
+                    return;
+                };
+                remote_transport = transport.Kind.parse(val) orelse {
+                    std.log.err("invalid transport '{s}' (expected udp or quic)", .{val});
+                    return;
+                };
+            } else if (std.mem.startsWith(u8, arg, "--transport=")) {
+                const val = arg["--transport=".len..];
+                remote_transport = transport.Kind.parse(val) orelse {
+                    std.log.err("invalid transport '{s}' (expected udp or quic)", .{val});
+                    return;
+                };
             } else if (session_name.len == 0) {
                 session_name = arg;
             } else {
@@ -415,11 +432,15 @@ pub fn main() !void {
 
         // Remote attach via encrypted UDP
         if (remote_host) |host| {
-            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+            const session = remote.connectRemote(alloc, host, sesh, remote_transport) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
                 return;
             };
-            return remote.remoteAttach(alloc, session);
+            remote.remoteAttach(alloc, session) catch |err| {
+                std.log.err("remote attach failed: {s}", .{@errorName(err)});
+                return;
+            };
+            return;
         }
 
         // Local attach (existing behavior)
@@ -448,8 +469,33 @@ pub fn main() !void {
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
-        const session_name = args.next() orelse "";
-        const sesh = try getSeshName(alloc, session_name);
+        var session_name: ?[]const u8 = null;
+        var serve_transport: transport.Kind = .udp;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--transport")) {
+                const val = args.next() orelse {
+                    std.log.err("missing value for --transport (expected udp or quic)", .{});
+                    return;
+                };
+                serve_transport = transport.Kind.parse(val) orelse {
+                    std.log.err("invalid transport '{s}' (expected udp or quic)", .{val});
+                    return;
+                };
+            } else if (std.mem.startsWith(u8, arg, "--transport=")) {
+                const val = arg["--transport=".len..];
+                serve_transport = transport.Kind.parse(val) orelse {
+                    std.log.err("invalid transport '{s}' (expected udp or quic)", .{val});
+                    return;
+                };
+            } else if (session_name == null) {
+                session_name = arg;
+            } else {
+                std.log.err("unexpected argument for serve: {s}", .{arg});
+                return;
+            }
+        }
+
+        const sesh = try getSeshName(alloc, session_name orelse "");
         defer alloc.free(sesh);
 
         // Ensure the session daemon exists (create if needed), same as attach
@@ -472,7 +518,7 @@ pub fn main() !void {
         const result = try ensureSession(&daemon);
         if (result.is_daemon) return; // we are the forked daemon child
 
-        return serve_mod.serveMain(alloc, sesh);
+        return serve_mod.serveMainWithTransport(alloc, sesh, serve_transport);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
 
@@ -565,9 +611,11 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
-        \\  [a]ttach -r <host> <name>      Attach to remote session via UDP
+        \\  [a]ttach -r <host> [--transport udp|quic] <name>
+        \\                                 Attach to remote session (udp default)
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
-        \\  [s]erve <name>                 Start UDP gateway for remote access
+        \\  [s]erve [--transport udp|quic] <name>
+        \\                                 Start remote gateway (udp default)
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)

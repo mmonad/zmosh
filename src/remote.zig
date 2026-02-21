@@ -3,6 +3,7 @@ const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
+const transport = @import("transport.zig");
 const builtin = @import("builtin");
 
 const c = switch (builtin.os.tag) {
@@ -28,10 +29,11 @@ pub const RemoteSession = struct {
     host: []const u8,
     port: u16,
     key: crypto.Key,
+    transport: transport.Kind,
 };
 
-/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
-pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key } {
+/// Parse a ZMX_CONNECT line: "ZMX_CONNECT <transport> <port> <base64_key>\n"
+pub fn parseConnectLine(line: []const u8) !struct { transport: transport.Kind, port: u16, key: crypto.Key } {
     const trimmed = std.mem.trimRight(u8, line, "\r\n");
     var it = std.mem.splitScalar(u8, trimmed, ' ');
 
@@ -39,7 +41,7 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
     if (!std.mem.eql(u8, prefix, "ZMX_CONNECT")) return error.InvalidConnectLine;
 
     const proto = it.next() orelse return error.InvalidConnectLine;
-    if (!std.mem.eql(u8, proto, "udp")) return error.UnsupportedProtocol;
+    const kind = transport.Kind.parse(proto) orelse return error.UnsupportedProtocol;
 
     const port_str = it.next() orelse return error.InvalidConnectLine;
     const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
@@ -47,26 +49,37 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
     const key_str = it.next() orelse return error.InvalidConnectLine;
     const key = crypto.keyFromBase64(key_str) catch return error.InvalidKey;
 
-    return .{ .port = port, .key = key };
+    return .{ .transport = kind, .port = port, .key = key };
 }
 
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
+pub fn connectRemote(
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    session: []const u8,
+    kind: transport.Kind,
+) !RemoteSession {
     const term = posix.getenv("TERM") orelse "xterm-256color";
     const colorterm = posix.getenv("COLORTERM");
+    const serve_cmd = if (kind == .udp)
+        try std.fmt.allocPrint(alloc, "zmosh serve {s}", .{session})
+    else
+        try std.fmt.allocPrint(alloc, "zmosh serve --transport {s} {s}", .{ kind.asString(), session });
+    defer alloc.free(serve_cmd);
+
     const remote_cmd = if (colorterm) |ct|
         try std.fmt.allocPrint(
             alloc,
-            "TERM={s} COLORTERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
-            .{ term, ct, session },
+            "TERM={s} COLORTERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" {s}",
+            .{ term, ct, serve_cmd },
         )
     else
         try std.fmt.allocPrint(
             alloc,
-            "TERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
-            .{ term, session },
+            "TERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" {s}",
+            .{ term, serve_cmd },
         );
     defer alloc.free(remote_cmd);
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
@@ -101,8 +114,13 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
     const result = parseConnectLine(buf[0..total]) catch |err| {
         log.err("failed to parse connect line: {s}", .{@errorName(err)});
         _ = child.wait() catch {};
-        return error.InvalidConnectLine;
+        return err;
     };
+    if (result.transport != kind) {
+        log.err("transport mismatch requested={s} got={s}", .{ kind.asString(), result.transport.asString() });
+        _ = child.wait() catch {};
+        return error.TransportMismatch;
+    }
 
     // Close our end of the pipes — we have the connect info.
     // Don't wait for SSH to exit: the remote gateway runs indefinitely.
@@ -120,6 +138,7 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         .host = host,
         .port = result.port,
         .key = result.key,
+        .transport = result.transport,
     };
 }
 
@@ -154,6 +173,16 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
 
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
+    switch (session.transport) {
+        .udp => return remoteAttachUdp(alloc, session),
+        .quic => {
+            log.err("QUIC transport is experimental and not implemented yet", .{});
+            return error.TransportNotImplemented;
+        },
+    }
+}
+
+fn remoteAttachUdp(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
     const addr = std.net.Address.resolveIp(session.host, session.port) catch blk: {
         const list = try std.net.getAddressList(alloc, session.host, session.port);
@@ -357,6 +386,13 @@ fn buildIpcBytes(tag: ipc.Tag, payload: []const u8, buf: []u8) []const u8 {
 
 test "parseConnectLine valid" {
     const result = try parseConnectLine("ZMX_CONNECT udp 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+    try std.testing.expect(result.transport == .udp);
+    try std.testing.expect(result.port == 60042);
+}
+
+test "parseConnectLine quic" {
+    const result = try parseConnectLine("ZMX_CONNECT quic 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+    try std.testing.expect(result.transport == .quic);
     try std.testing.expect(result.port == 60042);
 }
 

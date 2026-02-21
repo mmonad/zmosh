@@ -145,9 +145,9 @@ Usage: zmosh <command> [args]
 
 Commands:
   [a]ttach <name> [command...]   Attach to session, creating session if needed
-  [a]ttach -r <host> <name>      Attach to remote session via UDP
+  [a]ttach -r <host> [--transport udp|quic] <name>
   [r]un <name> [command...]      Send command without attaching, creating session if needed
-  [s]erve <name>                 Start UDP gateway for remote access
+  [s]erve [--transport udp|quic] <name>
   [d]etach                       Detach all clients from current session (ctrl+\ for current client)
   [l]ist [--short]               List active sessions
   [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
@@ -181,6 +181,9 @@ zmosh wait tests              # waits for tests to complete
 # (bootstraps via SSH, then switches to UDP)
 zmosh attach -r myserver dev
 
+# explicit transport (udp is the default)
+zmosh attach -r myserver --transport udp dev
+
 # short form
 zmosh a -r myserver dev
 
@@ -193,6 +196,8 @@ The remote workflow:
 2. The remote gateway binds a UDP port and prints a connect line with the session key
 3. zmosh reads the key, closes the SSH pipes, and switches to encrypted UDP
 4. If your network drops, the client shows a status bar and reconnects automatically when connectivity returns
+
+`--transport quic` is reserved as an experimental path and currently returns a `TransportNotImplemented` error.
 
 ## shell prompt
 
