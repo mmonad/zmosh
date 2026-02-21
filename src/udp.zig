@@ -193,7 +193,8 @@ pub const Peer = struct {
 
         const now = nanoNow();
 
-        // Anti-replay + roaming: only update state if seq > max_recv_seq
+        // Anti-replay + roaming: only update state if seq > max_recv_seq.
+        // Old or duplicate packets are dropped after authentication.
         if (decoded.seq > self.max_recv_seq) {
             self.addr = result.addr;
             self.max_recv_seq = decoded.seq;
@@ -210,9 +211,11 @@ pub const Peer = struct {
         } else if (decoded.seq == 0 and self.max_recv_seq == 0) {
             // First packet (seq 0)
             self.addr = result.addr;
+            self.max_recv_seq = 0;
             self.last_recv_time = now;
         } else {
             log.debug("old seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
+            return null;
         }
 
         if (self.state == .disconnected) {
@@ -353,14 +356,14 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
     try std.testing.expect(r1 != null);
     try std.testing.expect(peer.max_recv_seq == 10);
 
-    // Send lower seq — data returned, but max_recv_seq unchanged
+    // Send lower seq — packet is dropped.
     const old_port = peer.addr.?.getPort();
     try sock_send.sendTo(pkt_lo, target);
     try testPollReady(sock_recv.fd);
 
     var recv_buf2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &recv_buf2);
-    try std.testing.expect(r2 != null);
+    try std.testing.expect(r2 == null);
     try std.testing.expect(peer.max_recv_seq == 10);
     try std.testing.expect(peer.addr.?.getPort() == old_port);
 }

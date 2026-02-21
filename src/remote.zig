@@ -3,7 +3,13 @@ const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
+const transport = @import("transport.zig");
 const builtin = @import("builtin");
+
+const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
+const max_stdout_buf = 4 * 1024 * 1024;
+const ack_delay_ns = 20 * std.time.ns_per_ms;
+const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -152,6 +158,92 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
         std.mem.indexOf(u8, buf, "\x1b[92;5:1u") != null;
 }
 
+fn sendHeartbeat(
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_recv: *const transport.RecvState,
+    last_ack_send_ns: *i64,
+    ack_dirty: *bool,
+    now: i64,
+) !void {
+    var pkt_buf: [1200]u8 = undefined;
+    const pkt = try transport.buildUnreliable(
+        .heartbeat,
+        0,
+        reliable_recv.ack(),
+        reliable_recv.ackBits(),
+        "",
+        &pkt_buf,
+    );
+    try peer.send(sock, pkt);
+    last_ack_send_ns.* = now;
+    ack_dirty.* = false;
+}
+
+fn sendReliablePayload(
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *const transport.RecvState,
+    channel: transport.Channel,
+    payload: []const u8,
+    now: i64,
+) !void {
+    const packet = try reliable_send.buildAndTrack(
+        channel,
+        payload,
+        reliable_recv.ack(),
+        reliable_recv.ackBits(),
+        now,
+    );
+    peer.send(sock, packet) catch |err| {
+        if (err == error.NoPeerAddress or err == error.WouldBlock) return;
+        return err;
+    };
+}
+
+fn sendIpcReliable(
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *const transport.RecvState,
+    tag: ipc.Tag,
+    payload: []const u8,
+    now: i64,
+) !void {
+    if (payload.len <= max_ipc_payload) {
+        var buf: [transport.max_payload_len]u8 = undefined;
+        const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
+        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
+        return;
+    }
+
+    var off: usize = 0;
+    while (off < payload.len) {
+        const end = @min(off + max_ipc_payload, payload.len);
+        var buf: [transport.max_payload_len]u8 = undefined;
+        const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
+        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
+        off = end;
+    }
+}
+
+fn requestResync(
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *const transport.RecvState,
+    last_resync_request_ns: *i64,
+    now: i64,
+) !void {
+    if ((now - last_resync_request_ns.*) < resync_cooldown_ns) return;
+
+    var ctrl_buf: [8]u8 = undefined;
+    const payload = transport.buildControl(.resync_request, &ctrl_buf);
+    try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .control, payload, now);
+    last_resync_request_ns.* = now;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
@@ -174,6 +266,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Create peer
     var peer = udp_mod.Peer.init(session.key, .to_server);
     peer.addr = addr;
+
+    var reliable_send = try transport.ReliableSend.init(alloc);
+    defer reliable_send.deinit();
+    var reliable_recv = transport.RecvState{};
+    var output_recv = transport.OutputRecvState{};
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
@@ -203,17 +300,21 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     const stdin_flags = try posix.fcntl(posix.STDIN_FILENO, posix.F.GETFL, 0);
     _ = try posix.fcntl(posix.STDIN_FILENO, posix.F.SETFL, stdin_flags | posix.SOCK.NONBLOCK);
 
-    // Send Init message with terminal size
-    const size = getTerminalSize();
-    var init_buf: [128]u8 = undefined;
-    const init_ipc = buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-    try peer.send(&udp_sock, init_ipc);
-
     const config = udp_mod.Config{};
     var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     defer stdout_buf.deinit(alloc);
     var was_disconnected = false;
     var session_ended = false;
+
+    var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var ack_dirty = false;
+    var last_resync_request_ns: i64 = 0;
+
+    // Send Init message with terminal size (reliable)
+    const size = getTerminalSize();
+    var init_buf: [64]u8 = undefined;
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
 
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
@@ -221,14 +322,21 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         // Check SIGWINCH
         if (sigwinch_received.swap(false, .acq_rel)) {
             const new_size = getTerminalSize();
-            var resize_buf: [128]u8 = undefined;
-            const resize_ipc = buildIpcBytes(.Resize, std.mem.asBytes(&new_size), &resize_buf);
-            peer.send(&udp_sock, resize_ipc) catch {};
+            try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Resize, std.mem.asBytes(&new_size), now);
         }
 
-        // Heartbeat
-        if (peer.shouldSendHeartbeat(now, config)) {
-            peer.send(&udp_sock, "") catch {};
+        // Retransmit reliable packets based on adaptive RTO.
+        var retransmits = try reliable_send.collectRetransmits(alloc, now, peer.rto_us());
+        defer retransmits.deinit(alloc);
+        for (retransmits.items) |pkt| {
+            peer.send(&udp_sock, pkt) catch {};
+        }
+
+        // Ack heartbeat + keepalive heartbeat.
+        if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+        } else if (peer.shouldSendHeartbeat(now, config)) {
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
         }
 
         // State check
@@ -238,11 +346,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             return;
         }
         if (state == .disconnected and !was_disconnected) {
-            // Show disconnected status
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
             was_disconnected = true;
         } else if (state == .connected and was_disconnected) {
-            // Clear status line
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
             was_disconnected = false;
         }
@@ -257,13 +363,19 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_count = 3;
         }
 
-        const poll_timeout: i32 = @intCast(@min(config.heartbeat_interval_ms, 500));
-        _ = posix.poll(poll_fds[0..poll_count], poll_timeout) catch |err| {
+        var poll_timeout: i64 = @min(@as(i64, config.heartbeat_interval_ms), 500);
+        if (reliable_send.hasPending()) {
+            const rto_ms = @divFloor(peer.rto_us(), 1000);
+            poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
+        }
+        if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
+
+        _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
             return err;
         };
 
-        // STDIN → encrypt → send via UDP
+        // STDIN → reliable IPC over UDP
         if (poll_fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
             var input_raw: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(posix.STDIN_FILENO, &input_raw) catch |err| blk: {
@@ -273,43 +385,76 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             if (n_opt) |n| {
                 if (n > 0) {
                     if (input_raw[0] == 0x1C or isKittyCtrlBackslash(input_raw[0..n])) {
-                        // Detach
-                        var detach_buf: [128]u8 = undefined;
-                        const detach_ipc = buildIpcBytes(.Detach, "", &detach_buf);
-                        peer.send(&udp_sock, detach_ipc) catch {};
+                        try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Detach, "", now);
                         return;
                     }
-                    var ipc_buf: [4096 + @sizeOf(ipc.Header)]u8 = undefined;
-                    const input_ipc = buildIpcBytes(.Input, input_raw[0..n], &ipc_buf);
-                    peer.send(&udp_sock, input_ipc) catch {};
+                    try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Input, input_raw[0..n], now);
                 } else {
                     return; // EOF on stdin
                 }
             }
         }
 
-        // UDP recv → decrypt → extract IPC → write to stdout
+        // UDP recv → decode transport packets
         if (poll_fds[1].revents & posix.POLL.IN != 0) {
-            var decrypt_buf: [9000]u8 = undefined;
-            if (try peer.recv(&udp_sock, &decrypt_buf)) |result| {
-                if (result.data.len >= @sizeOf(ipc.Header)) {
-                    // Parse IPC messages from the decrypted plaintext
-                    var offset: usize = 0;
-                    while (offset < result.data.len) {
-                        const remaining = result.data[offset..];
-                        const msg_len = ipc.expectedLength(remaining) orelse break;
-                        if (remaining.len < msg_len) break;
+            while (true) {
+                var decrypt_buf: [9000]u8 = undefined;
+                const recv_result = try peer.recv(&udp_sock, &decrypt_buf);
+                const result = recv_result orelse break;
 
-                        const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                        const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+                const packet = transport.parsePacket(result.data) catch continue;
+                reliable_send.ack(packet.ack, packet.ack_bits);
 
-                        if (hdr.tag == .Output and payload.len > 0) {
-                            try stdout_buf.appendSlice(alloc, payload);
-                        } else if (hdr.tag == .SessionEnd) {
-                            session_ended = true;
+                switch (packet.channel) {
+                    .heartbeat => {},
+                    .control => {
+                        ack_dirty = true;
+                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
+                    },
+                    .reliable_ipc => {
+                        ack_dirty = true;
+                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
+
+                        var offset: usize = 0;
+                        while (offset < packet.payload.len) {
+                            const remaining = packet.payload[offset..];
+                            const msg_len = ipc.expectedLength(remaining) orelse break;
+                            if (remaining.len < msg_len) break;
+
+                            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                            const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+
+                            if (hdr.tag == .Output and payload.len > 0) {
+                                if (stdout_buf.items.len + payload.len > max_stdout_buf) {
+                                    stdout_buf.clearRetainingCapacity();
+                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                } else {
+                                    try stdout_buf.appendSlice(alloc, payload);
+                                }
+                            } else if (hdr.tag == .SessionEnd) {
+                                session_ended = true;
+                            }
+
+                            offset += msg_len;
                         }
-                        offset += msg_len;
-                    }
+                    },
+                    .output => {
+                        switch (output_recv.onPacket(packet.seq)) {
+                            .accept => {
+                                if (packet.payload.len == 0) continue;
+                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
+                                    stdout_buf.clearRetainingCapacity();
+                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                } else {
+                                    try stdout_buf.appendSlice(alloc, packet.payload);
+                                }
+                            },
+                            .gap => {
+                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                            },
+                            .duplicate, .stale => {},
+                        }
+                    },
                 }
             }
         }
@@ -328,7 +473,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         }
 
         if (session_ended) {
-            // Flush any remaining output before exiting
             if (stdout_buf.items.len > 0) {
                 _ = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch {};
             }
@@ -336,19 +480,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             return;
         }
     }
-}
-
-/// Build raw IPC bytes (header + payload) into a buffer.
-fn buildIpcBytes(tag: ipc.Tag, payload: []const u8, buf: []u8) []const u8 {
-    const header = ipc.Header{ .tag = tag, .len = @intCast(payload.len) };
-    const hdr_bytes = std.mem.asBytes(&header);
-    const total = @sizeOf(ipc.Header) + payload.len;
-    std.debug.assert(buf.len >= total);
-    @memcpy(buf[0..@sizeOf(ipc.Header)], hdr_bytes);
-    if (payload.len > 0) {
-        @memcpy(buf[@sizeOf(ipc.Header)..total], payload);
-    }
-    return buf[0..total];
 }
 
 // ---------------------------------------------------------------------------
@@ -366,16 +497,4 @@ test "parseConnectLine invalid prefix" {
 
 test "parseConnectLine unsupported protocol" {
     try std.testing.expectError(error.UnsupportedProtocol, parseConnectLine("ZMX_CONNECT tcp 60042 key\n"));
-}
-
-test "buildIpcBytes round-trip" {
-    var buf: [128]u8 = undefined;
-    const payload = "hello";
-    const ipc_bytes = buildIpcBytes(.Input, payload, &buf);
-
-    try std.testing.expect(ipc_bytes.len == @sizeOf(ipc.Header) + payload.len);
-    const hdr = std.mem.bytesToValue(ipc.Header, ipc_bytes[0..@sizeOf(ipc.Header)]);
-    try std.testing.expect(hdr.tag == .Input);
-    try std.testing.expect(hdr.len == payload.len);
-    try std.testing.expectEqualStrings(payload, ipc_bytes[@sizeOf(ipc.Header)..]);
 }
