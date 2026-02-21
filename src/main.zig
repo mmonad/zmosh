@@ -64,6 +64,7 @@ var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false
 const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
+    initialized: bool = false,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -195,6 +196,25 @@ const Daemon = struct {
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
+        // On re-attach, serialize terminal state BEFORE resize to capture the
+        // pre-reflow cursor position. On first attach we skip serialization
+        // entirely to avoid interfering with shell initialization (DA1 queries, etc.).
+        if (self.has_had_client and self.has_pty_output) {
+            const cursor = &term.screens.active.cursor;
+            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
+            if (serializeTerminalState(self.alloc, term)) |term_output| {
+                std.log.debug("serialize terminal state", .{});
+                defer self.alloc.free(term_output);
+                // Drop any PTY output buffered before Init so the snapshot is
+                // always the first payload this client renders on re-attach.
+                client.write_buf.clearRetainingCapacity();
+                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
+                };
+                client.has_pending_output = true;
+            }
+        }
+
         var ws: c.struct_winsize = .{
             .ws_row = resize.rows,
             .ws_col = resize.cols,
@@ -204,26 +224,9 @@ const Daemon = struct {
         _ = c.ioctl(pty_fd, c.TIOCSWINSZ, &ws);
         try term.resize(self.alloc, resize.cols, resize.rows);
 
-        // Serialize terminal state BEFORE resize to capture correct cursor position.
-        // Resizing triggers reflow which can move the cursor, and the shell's
-        // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
-            if (serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                defer self.alloc.free(term_output);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
-                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
-                };
-                client.has_pending_output = true;
-            }
-        }
-
         // Mark that we've had a client init, so subsequent clients get terminal state
         self.has_had_client = true;
+        client.initialized = true;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1395,8 +1398,11 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         }
                     }
 
-                    // Broadcast data to all clients
+                    // Broadcast PTY output only to initialized attach clients.
+                    // Utility clients (run/history/probe) never send Init and
+                    // should only receive explicit replies (Ack/History/Info).
                     for (daemon.clients.items) |client| {
+                        if (!client.initialized) continue;
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
                             std.log.warn("failed to buffer output for client err={s}", .{@errorName(err)});
                             continue;
@@ -1462,7 +1468,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 }
             }
 
-            if (revents & posix.POLL.OUT != 0) {
+            // A client can queue replies while handling POLL.IN (e.g. Init, Run, History, Info).
+            // Flush pending bytes immediately instead of waiting for another poll cycle.
+            if ((revents & posix.POLL.OUT != 0) or client.has_pending_output) {
                 // Flush pending output buffers
                 const n = posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
@@ -1743,7 +1751,10 @@ fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) 
     defer builder.deinit();
 
     var term_formatter = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-    term_formatter.content = .{ .selection = null };
+    const screen = term.screens.active;
+    const tl = screen.pages.getTopLeft(.active);
+    const br = screen.pages.getBottomRight(.active) orelse return null;
+    term_formatter.content = .{ .selection = ghostty_vt.Selection.init(tl, br, false) };
     term_formatter.extra = .{
         .palette = false,
         .modes = true,
@@ -1813,6 +1824,32 @@ test "isKittyCtrlBackslash" {
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;5:3u"));
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;1u"));
     try std.testing.expect(!isKittyCtrlBackslash("garbage"));
+}
+
+test "serializeTerminalState excludes scrollback after clear screen" {
+    var term = try ghostty_vt.Terminal.init(std.testing.allocator, .{
+        .cols = 40,
+        .rows = 8,
+        .max_scrollback = 10_000,
+    });
+    defer term.deinit(std.testing.allocator);
+
+    var vt_stream = term.vtStream();
+    defer vt_stream.deinit();
+
+    try vt_stream.nextSlice("old-before-clear-1\r\nold-before-clear-2\r\n");
+    try vt_stream.nextSlice("\x1b[H\x1b[2J");
+    try vt_stream.nextSlice("new-after-clear");
+
+    const snapshot = serializeTerminalState(std.testing.allocator, &term) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer std.testing.allocator.free(snapshot);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "new-after-clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "old-before-clear-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "old-before-clear-2") == null);
 }
 
 test "writeSessionLine formats output for current session and short output" {
