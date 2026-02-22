@@ -65,13 +65,13 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
     const remote_cmd = if (colorterm) |ct|
         try std.fmt.allocPrint(
             alloc,
-            "TERM={s} COLORTERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
+            "TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
             .{ term, ct, session },
         )
     else
         try std.fmt.allocPrint(
             alloc,
-            "TERM={s} PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$PATH\" zmosh serve {s}",
+            "TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
             .{ term, session },
         );
     defer alloc.free(remote_cmd);
