@@ -1318,7 +1318,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream = term.vtStream();
+    var vt_stream: ghostty_vt.Stream(ScrollPreservingHandler) = .initAlloc(
+        daemon.alloc,
+        ScrollPreservingHandler.init(&term),
+    );
     defer vt_stream.deinit();
 
     daemon_loop: while (daemon.running) {
@@ -1389,6 +1392,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
+                    vt_stream.handler.clear_detected = false;
                     try vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
 
@@ -1408,6 +1412,13 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     // should only receive explicit replies (Ack/History/Info).
                     for (daemon.clients.items) |client| {
                         if (!client.initialized) continue;
+                        // If ESC[2J was detected, prepend ESC[22J (scroll_complete)
+                        // so the client terminal pushes screen content to scrollback
+                        // before clearing. Terminals that don't support 22J ignore it
+                        // and the original ESC[2J in buf still clears the screen.
+                        if (vt_stream.handler.clear_detected) {
+                            ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, "\x1b[22J") catch {};
+                        }
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
                             std.log.warn("failed to buffer output for client err={s}", .{@errorName(err)});
                             continue;
@@ -1750,6 +1761,39 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
     return std.mem.indexOf(u8, buf, "\x1b[92;5u") != null or
         std.mem.indexOf(u8, buf, "\x1b[92;5:1u") != null;
 }
+
+/// A VT stream handler that detects ESC[2J (erase display complete) on the
+/// primary screen and sets a flag so the daemon can prepend a scroll-preserving
+/// sequence (ESC[22J) to client output before forwarding the raw bytes.
+///
+/// Also calls scrollClear() on the server-side VT as a safety net for shells
+/// without OSC 133 prompt annotations, where ghostty's built-in heuristic
+/// would skip scrollback preservation.
+const ScrollPreservingHandler = struct {
+    terminal: *ghostty_vt.Terminal,
+    clear_detected: bool = false,
+
+    pub fn init(terminal: *ghostty_vt.Terminal) ScrollPreservingHandler {
+        return .{ .terminal = terminal };
+    }
+
+    pub fn deinit(_: *ScrollPreservingHandler) void {}
+
+    pub fn vt(
+        self: *ScrollPreservingHandler,
+        comptime action: ghostty_vt.StreamAction.Tag,
+        value: ghostty_vt.StreamAction.Value(action),
+    ) !void {
+        if (comptime action == .erase_display_complete) {
+            if (self.terminal.screens.active_key == .primary) {
+                self.terminal.screens.active.scrollClear() catch {};
+                self.clear_detected = true;
+            }
+        }
+        var handler = self.terminal.vtHandler();
+        return handler.vt(action, value);
+    }
+};
 
 fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
