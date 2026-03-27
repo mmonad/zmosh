@@ -131,6 +131,7 @@ pub fn main() !void {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
                 return;
             };
+            defer alloc.free(session.host);
             return remote.remoteAttach(alloc, session);
         }
 

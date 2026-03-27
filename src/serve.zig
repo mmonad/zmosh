@@ -101,10 +101,20 @@ pub const Gateway = struct {
         const key = crypto.generateKey();
         const encoded_key = crypto.keyToBase64(key);
 
+        // Extract server IP from SSH_CONNECTION (set by sshd):
+        // format: "<client_ip> <client_port> <server_ip> <server_port>"
+        const server_ip = blk: {
+            const ssh_conn = posix.getenv("SSH_CONNECTION") orelse break :blk "127.0.0.1";
+            var it = std.mem.splitScalar(u8, ssh_conn, ' ');
+            _ = it.next(); // client_ip
+            _ = it.next(); // client_port
+            break :blk it.next() orelse "127.0.0.1";
+        };
+
         // Print bootstrap line for SSH capture
         {
             var out_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
+            const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {s} {d} {s}\n", .{ server_ip, udp_sock.bound_port, encoded_key }) catch unreachable;
             _ = try posix.write(posix.STDOUT_FILENO, line);
         }
 
@@ -511,23 +521,20 @@ test "bootstrap output format" {
     const key = crypto.generateKey();
     const encoded = crypto.keyToBase64(key);
     const port: u16 = 60042;
+    const host = "10.50.0.102";
 
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "ZMX_CONNECT udp {d} {s}\n", .{ port, encoded });
+    const line = try std.fmt.bufPrint(&buf, "ZMX_CONNECT udp {s} {d} {s}\n", .{ host, port, encoded });
 
     // Verify it starts with the expected prefix
     try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp "));
 
-    // Parse back
-    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, line, "\n"), ' ');
-    try std.testing.expectEqualStrings("ZMX_CONNECT", it.next().?);
-    try std.testing.expectEqualStrings("udp", it.next().?);
-    const port_str = it.next().?;
-    const parsed_port = try std.fmt.parseInt(u16, port_str, 10);
-    try std.testing.expect(parsed_port == 60042);
-    const key_str = it.next().?;
-    const decoded_key = try crypto.keyFromBase64(key_str);
-    try std.testing.expectEqual(key, decoded_key);
+    // Parse back via remote.parseConnectLine
+    const remote = @import("remote.zig");
+    const result = try remote.parseConnectLine(line);
+    try std.testing.expectEqualStrings("10.50.0.102", result.host);
+    try std.testing.expect(result.port == 60042);
+    try std.testing.expectEqual(key, result.key);
 }
 
 test "resolveSocketDir returns valid path" {

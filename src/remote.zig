@@ -36,8 +36,8 @@ pub const RemoteSession = struct {
     key: crypto.Key,
 };
 
-/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
-pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key } {
+/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <host> <port> <base64_key>\n"
+pub fn parseConnectLine(line: []const u8) !struct { host: []const u8, port: u16, key: crypto.Key } {
     const trimmed = std.mem.trimRight(u8, line, "\r\n");
     var it = std.mem.splitScalar(u8, trimmed, ' ');
 
@@ -47,13 +47,15 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
     const proto = it.next() orelse return error.InvalidConnectLine;
     if (!std.mem.eql(u8, proto, "udp")) return error.UnsupportedProtocol;
 
+    const host = it.next() orelse return error.InvalidConnectLine;
+
     const port_str = it.next() orelse return error.InvalidConnectLine;
     const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
 
     const key_str = it.next() orelse return error.InvalidConnectLine;
     const key = crypto.keyFromBase64(key_str) catch return error.InvalidKey;
 
-    return .{ .port = port, .key = key };
+    return .{ .host = host, .port = port, .key = key };
 }
 
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
@@ -122,8 +124,10 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         child.stdout = null;
     }
 
+    const gateway_host = try alloc.dupe(u8, result.host);
+
     return .{
-        .host = host,
+        .host = gateway_host,
         .port = result.port,
         .key = result.key,
     };
