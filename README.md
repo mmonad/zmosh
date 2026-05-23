@@ -44,13 +44,13 @@ Locally, zmosh **is** zmx. Every local feature works identically. The new capabi
 
 ## comparison with remote terminal tools
 
-| Feature | zmosh | mosh | Eternal Terminal | tssh |
+| Feature | zmosh | mosh | Eternal Terminal | tssh (with tsshd) |
 | --- | --- | --- | --- | --- |
-| Encrypted transport | ✓ (XChaCha20-Poly1305) | ✓ (AES-128-OCB) | ✓ (AES) | ✓ (SSH) |
-| UDP auto-reconnect | ✓ | ✓ | ✗ (TCP) | ✗ (TCP) |
-| IP roaming | ✓ | ✓ | ✗ | ✗ |
-| Session persistence (detach/reattach) | ✓ | ✗ | ✓ | ✗ |
-| Terminal state restore | ✓ (libghostty-vt) | ✓ (own VT) | ✓ | ✗ |
+| Encrypted transport | ✓ (XChaCha20-Poly1305) | ✓ (AES-128-OCB) | ✓ (AES) | ✓ (AES-256-GCM) |
+| UDP auto-reconnect | ✓ | ✓ | ✗ (TCP) | ✓ |
+| IP roaming | ✓ | ✓ | ✗ | ✓ |
+| Session persistence (detach/reattach) | ✓ | ✗ | ✓ | ✓ |
+| Terminal state restore | ✓ (libghostty-vt) | ✓ (own VT) | ✓ | ✓ (go-te) |
 | Native terminal scrollback | ✓ | ✗ | ✓ | ✓ |
 | Multiple clients per session | ✓ | ✗ | ✗ | ✗ |
 | Local sessions (no network) | ✓ | ✗ | ✗ | ✗ |
@@ -451,19 +451,19 @@ The UDP auto-reconnect design draws from:
 
 ## comparison with session persistence tools
 
-| Feature | zmosh | zmx | shpool | abduco | dtach | tmux |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1:1 Terminal emulator features | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
-| Terminal state restore | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
-| Window management | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Multiple clients per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
-| Native scrollback | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
-| Auto-daemonize | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Daemon per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ |
-| Session listing | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
-| Encrypted remote sessions | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| UDP auto-reconnect | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| IP roaming | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Feature | zmosh | zmx | shpool | abduco | dtach | tmux | tsshd |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1:1 Terminal emulator features | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| Terminal state restore | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
+| Window management | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| Multiple clients per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ |
+| Native scrollback | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| Auto-daemonize | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Daemon per session | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ |
+| Session listing | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| Encrypted remote sessions | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| UDP auto-reconnect | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| IP roaming | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 
 ## community tools
 
