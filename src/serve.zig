@@ -9,9 +9,8 @@ const log = std.log.scoped(.serve);
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_unix_write_buf = 1024 * 1024;
-const max_output_coalesce = 256 * 1024;
+const max_reliable_backlog = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -58,22 +57,20 @@ pub const Gateway = struct {
     peer: udp.Peer,
     unix_read_buf: ipc.SocketBuffer,
     unix_write_buf: std.ArrayList(u8),
-    output_coalesce_buf: std.ArrayList(u8),
 
     reliable_send: transport.ReliableSend,
-    reliable_recv: transport.RecvState,
-    output_seq: u32,
+    reliable_recv: transport.OrderedRecv,
+
+    awaiting_restore: bool,
+    snapshot_active: bool,
+    snapshot_generation: u32,
+    snapshot_seq_range: transport.SnapshotSeqRange,
 
     config: udp.Config,
     running: bool,
 
-    last_output_flush_ns: i64,
     last_ack_send_ns: i64,
     ack_dirty: bool,
-
-    last_resync_request_ns: i64,
-    have_client_size: bool,
-    last_resize: ipc.Resize,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -104,7 +101,7 @@ pub const Gateway = struct {
         // Print bootstrap line for SSH capture
         {
             var out_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
+            const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp-v2 {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
             _ = try posix.write(posix.STDOUT_FILENO, line);
         }
 
@@ -116,8 +113,9 @@ pub const Gateway = struct {
 
         const unix_read_buf = try ipc.SocketBuffer.init(alloc);
         const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-        const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const reliable_send = try transport.ReliableSend.init(alloc);
+        var reliable_recv = try transport.OrderedRecv.init(alloc);
+        errdefer reliable_recv.deinit();
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
@@ -130,18 +128,16 @@ pub const Gateway = struct {
             .peer = peer,
             .unix_read_buf = unix_read_buf,
             .unix_write_buf = unix_write_buf,
-            .output_coalesce_buf = output_coalesce_buf,
             .reliable_send = reliable_send,
-            .reliable_recv = .{},
-            .output_seq = 1,
+            .reliable_recv = reliable_recv,
+            .awaiting_restore = false,
+            .snapshot_active = false,
+            .snapshot_generation = 0,
+            .snapshot_seq_range = .{ .first = 0, .last = 0 },
             .config = config,
             .running = true,
-            .last_output_flush_ns = now,
             .last_ack_send_ns = now,
             .ack_dirty = false,
-            .last_resync_request_ns = 0,
-            .have_client_size = false,
-            .last_resize = .{ .rows = 24, .cols = 80 },
         };
     }
 
@@ -163,8 +159,8 @@ pub const Gateway = struct {
                 break;
             }
 
-            try self.flushRetransmits(now);
-            try self.flushOutput(now, false);
+            try self.flushReliable(now);
+            self.updateSnapshotState();
 
             if (self.peer.addr != null) {
                 if (self.ack_dirty and (now - self.last_ack_send_ns >= ack_delay_ns)) {
@@ -182,17 +178,24 @@ pub const Gateway = struct {
             var poll_fds: [2]posix.pollfd = undefined;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
-            var unix_events: i16 = posix.POLL.IN;
+            // Reliable terminal output is intentionally backpressured. Once
+            // the network queue reaches the cap, let the Unix socket apply
+            // normal stream backpressure until acknowledgements drain it.
+            var unix_events: i16 = if (self.reliable_send.pendingBytes() < max_reliable_backlog)
+                posix.POLL.IN
+            else
+                0;
             if (self.unix_write_buf.items.len > 0) {
                 unix_events |= posix.POLL.OUT;
             }
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
-            const poll_timeout = self.computePollTimeoutMs(now);
+            const poll_timeout = self.computePollTimeoutMs();
             _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
                 if (err == error.Interrupted) continue;
                 return err;
             };
+            const polled_unix_fd = poll_fds[1].fd;
 
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
@@ -200,12 +203,12 @@ pub const Gateway = struct {
                     var decrypt_buf: [9000]u8 = undefined;
                     const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
                     const result = recv_result orelse break;
-                    try self.handleTransportPacket(result.data, now);
+                    try self.handleTransportPacket(result.data);
                 }
             }
 
             // Handle Unix socket read → forward to UDP transport
-            if (poll_fds[1].revents & posix.POLL.IN != 0) {
+            if (polled_unix_fd == self.unix_fd and poll_fds[1].revents & posix.POLL.IN != 0) {
                 while (true) {
                     const n = self.unix_read_buf.read(self.unix_fd) catch |err| {
                         if (err == error.WouldBlock) break;
@@ -221,13 +224,13 @@ pub const Gateway = struct {
                     }
 
                     while (self.unix_read_buf.next()) |msg| {
-                        try self.forwardDaemonMessage(msg.header.tag, msg.payload, now);
+                        try self.forwardDaemonMessage(msg.header.tag, msg.payload);
                     }
                 }
             }
 
             // Flush buffered writes to Unix socket
-            if (poll_fds[1].revents & posix.POLL.OUT != 0) {
+            if (polled_unix_fd == self.unix_fd and poll_fds[1].revents & posix.POLL.OUT != 0) {
                 if (self.unix_write_buf.items.len > 0) {
                     const written = posix.write(self.unix_fd, self.unix_write_buf.items) catch |err| blk: {
                         if (err == error.WouldBlock) break :blk @as(usize, 0);
@@ -241,7 +244,7 @@ pub const Gateway = struct {
                 }
             }
 
-            if (poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            if (polled_unix_fd == self.unix_fd and poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
                 log.info("unix socket closed/error", .{});
                 break;
             }
@@ -249,21 +252,16 @@ pub const Gateway = struct {
 
         // Notify client that the session has ended.
         if (self.peer.addr != null) {
-            self.sendIpcReliable(.SessionEnd, "", @intCast(std.time.nanoTimestamp())) catch |err| {
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            self.sendIpcReliable(.SessionEnd, "") catch |err| {
                 log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
             };
+            self.flushReliable(now) catch {};
         }
     }
 
-    fn computePollTimeoutMs(self: *const Gateway, now: i64) i32 {
+    fn computePollTimeoutMs(self: *const Gateway) i32 {
         var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
-
-        if (self.output_coalesce_buf.items.len > 0) {
-            const flush_due = self.last_output_flush_ns + self.outputFlushIntervalNs();
-            const remaining_ns = flush_due - now;
-            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
-            timeout = @min(timeout, remaining_ms);
-        }
 
         if (self.reliable_send.hasPending()) {
             const rto_ms = @divFloor(self.peer.rto_us(), 1000);
@@ -273,12 +271,6 @@ pub const Gateway = struct {
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
         return @intCast(@max(@as(i64, 0), timeout));
-    }
-
-    fn outputFlushIntervalNs(self: *const Gateway) i64 {
-        const srtt_us = self.peer.srtt_us orelse 32_000;
-        const paced_us = std.math.clamp(@divFloor(srtt_us, 8), @as(i64, 2_000), @as(i64, 8_000));
-        return paced_us * std.time.ns_per_us;
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
@@ -296,8 +288,8 @@ pub const Gateway = struct {
         self.ack_dirty = false;
     }
 
-    fn flushRetransmits(self: *Gateway, now: i64) !void {
-        var packets = try self.reliable_send.collectRetransmits(self.alloc, now, self.peer.rto_us());
+    fn flushReliable(self: *Gateway, now: i64) !void {
+        var packets = try self.reliable_send.collectTransmissions(self.alloc, now, self.peer.rto_us());
         defer packets.deinit(self.alloc);
 
         for (packets.items) |packet| {
@@ -308,60 +300,7 @@ pub const Gateway = struct {
         }
     }
 
-    fn flushOutput(self: *Gateway, now: i64, force: bool) !void {
-        if (self.output_coalesce_buf.items.len == 0) return;
-        if (!force and (now - self.last_output_flush_ns) < self.outputFlushIntervalNs()) return;
-
-        if (self.peer.addr == null) {
-            self.output_coalesce_buf.clearRetainingCapacity();
-            self.last_output_flush_ns = now;
-            return;
-        }
-
-        var sent_off: usize = 0;
-        while (sent_off < self.output_coalesce_buf.items.len) {
-            const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
-            const chunk = self.output_coalesce_buf.items[sent_off..end];
-
-            var pkt_buf: [1200]u8 = undefined;
-            const seq = self.output_seq;
-            self.output_seq +%= 1;
-            const pkt = try transport.buildUnreliable(
-                .output,
-                seq,
-                self.reliable_recv.ack(),
-                self.reliable_recv.ackBits(),
-                chunk,
-                &pkt_buf,
-            );
-
-            self.peer.send(&self.udp_sock, pkt) catch |err| {
-                if (err == error.WouldBlock) {
-                    log.debug("udp output send would block; dropping stale output and requesting resync", .{});
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    try self.requestSnapshot(now);
-                    self.last_output_flush_ns = now;
-                    return;
-                }
-                if (err == error.NoPeerAddress) {
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    self.last_output_flush_ns = now;
-                    return;
-                }
-                return err;
-            };
-
-            sent_off = end;
-        }
-
-        if (sent_off > 0) {
-            self.output_coalesce_buf.replaceRange(self.alloc, 0, sent_off, &[_]u8{}) catch unreachable;
-        }
-
-        self.last_output_flush_ns = now;
-    }
-
-    fn trackClientResize(self: *Gateway, payload: []const u8) void {
+    fn trackClientMessages(self: *Gateway, payload: []const u8) void {
         var offset: usize = 0;
         while (offset < payload.len) {
             const remaining = payload[offset..];
@@ -369,10 +308,8 @@ pub const Gateway = struct {
             if (remaining.len < msg_len) break;
 
             const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-            const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len == @sizeOf(ipc.Resize)) {
-                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload);
-                self.have_client_size = true;
+            if (hdr.tag == .Restore and !self.snapshot_active) {
+                self.awaiting_restore = true;
             }
 
             offset += msg_len;
@@ -386,18 +323,37 @@ pub const Gateway = struct {
         try self.unix_write_buf.appendSlice(self.alloc, payload);
     }
 
-    fn requestSnapshot(self: *Gateway, now: i64) !void {
-        if ((now - self.last_resync_request_ns) < resync_cooldown_ns) return;
-        self.last_resync_request_ns = now;
+    fn queueSnapshot(self: *Gateway, payload: []const u8) !void {
+        self.snapshot_generation +%= 1;
+        if (self.snapshot_generation == 0) self.snapshot_generation = 1;
 
-        const size = if (self.have_client_size) self.last_resize else ipc.Resize{ .rows = 24, .cols = 80 };
-        var init_buf: [64]u8 = undefined;
-        const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-        try self.appendUnixWrite(init_ipc);
-        log.debug("requested terminal snapshot rows={d} cols={d}", .{ size.rows, size.cols });
+        self.snapshot_seq_range = try transport.queueSnapshot(
+            &self.reliable_send,
+            self.snapshot_generation,
+            payload,
+            1,
+            self.reliable_recv.ack(),
+            self.reliable_recv.ackBits(),
+        );
+        self.awaiting_restore = false;
+        self.snapshot_active = true;
+        log.info("queued terminal snapshot generation={d} bytes={d} reliable_seq={d}..{d}", .{
+            self.snapshot_generation,
+            payload.len,
+            self.snapshot_seq_range.first,
+            self.snapshot_seq_range.last,
+        });
     }
 
-    fn handleTransportPacket(self: *Gateway, plaintext: []const u8, now: i64) !void {
+    fn updateSnapshotState(self: *Gateway) void {
+        if (!self.snapshot_active) return;
+        if (self.reliable_send.hasPendingRange(self.snapshot_seq_range.first, self.snapshot_seq_range.last)) return;
+
+        self.snapshot_active = false;
+        log.info("terminal snapshot acknowledged generation={d}", .{self.snapshot_generation});
+    }
+
+    fn handleTransportPacket(self: *Gateway, plaintext: []const u8) !void {
         const packet = transport.parsePacket(plaintext) catch |err| {
             log.debug("transport parse failed: {s}", .{@errorName(err)});
             return;
@@ -410,50 +366,56 @@ pub const Gateway = struct {
             .output => {
                 // Client never sends output channel packets.
             },
-            .reliable_ipc, .control => {
+            .reliable_ipc, .control, .snapshot => {
                 self.ack_dirty = true;
-                const action = self.reliable_recv.onReliable(packet.seq);
-                if (action != .accept) return;
+                const action = try self.reliable_recv.push(packet);
+                if (action == .stale) {
+                    log.warn("reliable packet outside receive window seq={d}", .{packet.seq});
+                }
 
-                if (packet.channel == .reliable_ipc) {
-                    self.trackClientResize(packet.payload);
-                    self.appendUnixWrite(packet.payload) catch |err| {
-                        log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
-                        self.running = false;
-                        return;
-                    };
-                } else {
-                    const ctrl = transport.parseControl(packet.payload) catch return;
-                    if (ctrl == .resync_request) {
-                        self.requestSnapshot(now) catch |err| {
-                            log.warn("failed to queue snapshot request: {s}", .{@errorName(err)});
-                            self.running = false;
-                        };
-                    }
+                while (self.reliable_recv.popReady()) |ready| {
+                    defer ready.deinit();
+                    try self.handleReliablePacket(ready.channel, ready.payload);
                 }
             },
         }
     }
 
-    fn sendReliablePayload(self: *Gateway, channel: transport.Channel, payload: []const u8, now: i64) !void {
-        const packet = try self.reliable_send.buildAndTrack(
+    fn handleReliablePacket(self: *Gateway, channel: transport.Channel, payload: []const u8) !void {
+        switch (channel) {
+            .reliable_ipc => {
+                self.trackClientMessages(payload);
+                self.appendUnixWrite(payload) catch |err| {
+                    log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
+                    self.running = false;
+                };
+            },
+            .control => {
+                const ctrl = transport.parseControl(payload) catch return;
+                if (ctrl == .resync_request) {
+                    // Repainting an attached terminal is never automatic. A
+                    // client that needs state reconnects with --restore.
+                    log.warn("ignored automatic terminal snapshot request", .{});
+                }
+            },
+            .heartbeat, .output, .snapshot => {},
+        }
+    }
+
+    fn sendReliablePayload(self: *Gateway, channel: transport.Channel, payload: []const u8) !void {
+        _ = try self.reliable_send.queue(
             channel,
             payload,
             self.reliable_recv.ack(),
             self.reliable_recv.ackBits(),
-            now,
         );
-        self.peer.send(&self.udp_sock, packet) catch |err| {
-            if (err == error.NoPeerAddress or err == error.WouldBlock) return;
-            return err;
-        };
     }
 
-    fn sendIpcReliable(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
+    fn sendIpcReliable(self: *Gateway, tag: ipc.Tag, payload: []const u8) !void {
         if (payload.len <= max_ipc_payload) {
             var buf: [transport.max_payload_len]u8 = undefined;
             const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
-            try self.sendReliablePayload(.reliable_ipc, ipc_bytes, now);
+            try self.sendReliablePayload(.reliable_ipc, ipc_bytes);
             return;
         }
 
@@ -462,28 +424,25 @@ pub const Gateway = struct {
             const end = @min(off + max_ipc_payload, payload.len);
             var buf: [transport.max_payload_len]u8 = undefined;
             const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
-            try self.sendReliablePayload(.reliable_ipc, ipc_bytes, now);
+            try self.sendReliablePayload(.reliable_ipc, ipc_bytes);
             off = end;
         }
     }
 
-    fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
+    fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8) !void {
         if (tag == .Output) {
-            if (self.output_coalesce_buf.items.len + payload.len > max_output_coalesce) {
-                log.debug("output coalesce buffer overflow; dropping stale output and requesting snapshot", .{});
-                self.output_coalesce_buf.clearRetainingCapacity();
-                try self.requestSnapshot(now);
+            if (self.awaiting_restore) {
+                try self.queueSnapshot(payload);
                 return;
             }
-            try self.output_coalesce_buf.appendSlice(self.alloc, payload);
-            if (self.output_coalesce_buf.items.len >= transport.max_payload_len * 4) {
-                try self.flushOutput(now, true);
-            }
+            // Terminal bytes are a stateful stream: losing one cursor escape
+            // corrupts every following update. Put Output on the same ordered,
+            // retransmitted channel as the rest of IPC.
+            try self.sendIpcReliable(.Output, payload);
             return;
         }
 
-        try self.flushOutput(now, true);
-        try self.sendIpcReliable(tag, payload, now);
+        try self.sendIpcReliable(tag, payload);
     }
 
     pub fn deinit(self: *Gateway) void {
@@ -491,8 +450,8 @@ pub const Gateway = struct {
         self.udp_sock.close();
         self.unix_read_buf.deinit();
         self.unix_write_buf.deinit(self.alloc);
-        self.output_coalesce_buf.deinit(self.alloc);
         self.reliable_send.deinit();
+        self.reliable_recv.deinit();
     }
 };
 
@@ -513,15 +472,15 @@ test "bootstrap output format" {
     const port: u16 = 60042;
 
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "ZMX_CONNECT udp {d} {s}\n", .{ port, encoded });
+    const line = try std.fmt.bufPrint(&buf, "ZMX_CONNECT udp-v2 {d} {s}\n", .{ port, encoded });
 
     // Verify it starts with the expected prefix
-    try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp "));
+    try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp-v2 "));
 
     // Parse back
     var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, line, "\n"), ' ');
     try std.testing.expectEqualStrings("ZMX_CONNECT", it.next().?);
-    try std.testing.expectEqualStrings("udp", it.next().?);
+    try std.testing.expectEqualStrings("udp-v2", it.next().?);
     const port_str = it.next().?;
     const parsed_port = try std.fmt.parseInt(u16, port_str, 10);
     try std.testing.expect(parsed_port == 60042);

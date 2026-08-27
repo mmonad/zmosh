@@ -8,7 +8,7 @@ const transport = @import("transport.zig");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const alloc = std.heap.page_allocator;
 
 // Silence all logging in library mode.
 pub const std_options: std.Options = .{
@@ -37,6 +37,7 @@ pub const Status = enum(c_int) {
     err_null = 7,
     err_send = 8,
     err_too_large = 9,
+    err_output_stream_lost = 10,
 };
 
 pub const State = enum(c_int) {
@@ -59,13 +60,13 @@ const Session = struct {
     config: udp_mod.Config,
 
     reliable_send: transport.ReliableSend,
-    reliable_recv: transport.RecvState,
+    reliable_recv: transport.OrderedRecv,
     output_recv: transport.OutputRecvState,
+    snapshot: transport.SnapshotAssembler,
+    restoring: bool,
 
     last_ack_send_ns: i64,
     ack_dirty: bool,
-    last_resync_request_ns: i64,
-
     output_cb: OutputFn,
     state_cb: ?StateFn,
     end_cb: ?SessionEndFn,
@@ -94,25 +95,20 @@ fn sendHeartbeat(s: *Session, now: i64) !void {
     s.ack_dirty = false;
 }
 
-fn sendReliablePayload(s: *Session, channel: transport.Channel, payload: []const u8, now: i64) !void {
-    const packet = try s.reliable_send.buildAndTrack(
+fn sendReliablePayload(s: *Session, channel: transport.Channel, payload: []const u8) !void {
+    _ = try s.reliable_send.queue(
         channel,
         payload,
         s.reliable_recv.ack(),
         s.reliable_recv.ackBits(),
-        now,
     );
-    s.peer.send(&s.udp_sock, packet) catch |err| {
-        if (err == error.NoPeerAddress or err == error.WouldBlock) return;
-        return err;
-    };
 }
 
-fn sendIpcReliable(s: *Session, tag: ipc.Tag, payload: []const u8, now: i64) !void {
+fn sendIpcReliable(s: *Session, tag: ipc.Tag, payload: []const u8) !void {
     if (payload.len <= max_ipc_payload) {
         var buf: [transport.max_payload_len]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
-        try sendReliablePayload(s, .reliable_ipc, ipc_bytes, now);
+        try sendReliablePayload(s, .reliable_ipc, ipc_bytes);
         return;
     }
 
@@ -121,18 +117,68 @@ fn sendIpcReliable(s: *Session, tag: ipc.Tag, payload: []const u8, now: i64) !vo
         const end = @min(off + max_ipc_payload, payload.len);
         var buf: [transport.max_payload_len]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
-        try sendReliablePayload(s, .reliable_ipc, ipc_bytes, now);
+        try sendReliablePayload(s, .reliable_ipc, ipc_bytes);
         off = end;
     }
 }
 
-fn requestResync(s: *Session, now: i64) !void {
-    if ((now - s.last_resync_request_ns) < resync_cooldown_ns) return;
+fn flushReliable(s: *Session, now: i64) !void {
+    var transmissions = try s.reliable_send.collectTransmissions(alloc, now, s.peer.rto_us());
+    defer transmissions.deinit(alloc);
+    for (transmissions.items) |packet| {
+        s.peer.send(&s.udp_sock, packet) catch |err| {
+            if (err == error.NoPeerAddress or err == error.WouldBlock) continue;
+            return err;
+        };
+    }
+}
 
-    var ctrl_buf: [8]u8 = undefined;
-    const payload = transport.buildControl(.resync_request, &ctrl_buf);
-    try sendReliablePayload(s, .control, payload, now);
-    s.last_resync_request_ns = now;
+fn beginRestore(s: *Session) void {
+    s.output_recv.clear();
+    s.snapshot.reset();
+    s.restoring = true;
+}
+
+fn handleReliablePayload(s: *Session, channel: transport.Channel, payload: []const u8) !void {
+    switch (channel) {
+        .reliable_ipc => {
+            var offset: usize = 0;
+            while (offset < payload.len) {
+                const remaining = payload[offset..];
+                const msg_len = ipc.expectedLength(remaining) orelse break;
+                if (remaining.len < msg_len) break;
+
+                const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
+                if (hdr.tag == .Output and msg_payload.len > 0 and !s.restoring) {
+                    s.output_cb(s.ctx, msg_payload.ptr, @intCast(msg_payload.len));
+                } else if (hdr.tag == .SessionEnd) {
+                    s.session_ended = true;
+                    if (s.end_cb) |cb| cb(s.ctx);
+                }
+                offset += msg_len;
+            }
+        },
+        .snapshot => {
+            const frame = transport.parseSnapshotFrame(payload) catch return error.OutputStreamLost;
+            if (frame.kind == .begin) {
+                beginRestore(s);
+            } else if (!s.snapshot.active) {
+                return;
+            }
+
+            const completed = s.snapshot.accept(frame) catch return error.OutputStreamLost;
+            if (completed) |value| {
+                defer value.deinit(alloc);
+                if (value.data.len > 0) {
+                    s.output_cb(s.ctx, value.data.ptr, @intCast(value.data.len));
+                }
+                s.output_recv.reset(value.resume_output_seq);
+                s.restoring = false;
+            }
+        },
+        .heartbeat, .output, .control => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,30 +252,53 @@ export fn zmosh_connect(
     peer.addr = addr;
 
     const now: i64 = @intCast(std.time.nanoTimestamp());
-    var reliable_send = transport.ReliableSend.init(std.heap.page_allocator) catch {
+    var reliable_send = transport.ReliableSend.init(alloc) catch {
         udp_sock.close();
         set_status(status, .err_socket);
         return null;
     };
-    errdefer reliable_send.deinit();
-
-    // Send Init with terminal size (reliable)
-    const size = ipc.Resize{ .rows = rows, .cols = cols };
-    var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-
-    const init_packet = reliable_send.buildAndTrack(.reliable_ipc, init_ipc, 0, 0, now) catch {
+    var reliable_recv = transport.OrderedRecv.init(alloc) catch {
         reliable_send.deinit();
         udp_sock.close();
         set_status(status, .err_socket);
         return null;
     };
-    peer.send(&udp_sock, init_packet) catch {
-        // Keep session alive; packet will be retried by zmosh_poll.
+    var output_recv = transport.OutputRecvState.init(alloc) catch {
+        reliable_recv.deinit();
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
+    };
+    var snapshot = transport.SnapshotAssembler.init(alloc) catch {
+        output_recv.deinit();
+        reliable_recv.deinit();
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
+    };
+
+    // Initialize dimensions without requesting a synthetic terminal repaint.
+    const size = ipc.Resize{ .rows = rows, .cols = cols };
+    var init_buf: [64]u8 = undefined;
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+
+    _ = reliable_send.queue(.reliable_ipc, init_ipc, 0, 0) catch {
+        snapshot.deinit();
+        output_recv.deinit();
+        reliable_recv.deinit();
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
     };
 
     // Allocate session
-    const session = std.heap.page_allocator.create(Session) catch {
+    const session = alloc.create(Session) catch {
+        snapshot.deinit();
+        output_recv.deinit();
+        reliable_recv.deinit();
         reliable_send.deinit();
         udp_sock.close();
         set_status(status, .err_socket);
@@ -240,11 +309,12 @@ export fn zmosh_connect(
         .peer = peer,
         .config = .{},
         .reliable_send = reliable_send,
-        .reliable_recv = .{},
-        .output_recv = .{},
+        .reliable_recv = reliable_recv,
+        .output_recv = output_recv,
+        .snapshot = snapshot,
+        .restoring = false,
         .last_ack_send_ns = now,
         .ack_dirty = false,
-        .last_resync_request_ns = 0,
         .output_cb = cb,
         .state_cb = state_cb,
         .end_cb = end_cb,
@@ -252,6 +322,10 @@ export fn zmosh_connect(
         .last_state = .connected,
         .session_ended = false,
     };
+
+    // Send Init immediately; zmosh_poll retransmits it if this datagram is
+    // lost or the socket is temporarily blocked.
+    flushReliable(session, now) catch {};
 
     set_status(status, .ok);
     return session;
@@ -268,12 +342,16 @@ export fn zmosh_poll(session: ?*Session) Status {
 
     const now: i64 = @intCast(std.time.nanoTimestamp());
 
-    // Retransmit reliable packets.
-    var retransmits = s.reliable_send.collectRetransmits(std.heap.page_allocator, now, s.peer.rto_us()) catch return .err_poll;
-    defer retransmits.deinit(std.heap.page_allocator);
-    for (retransmits.items) |pkt| {
-        s.peer.send(&s.udp_sock, pkt) catch {};
+    const reorder_timeout_ns = std.math.clamp(
+        2 * (s.peer.srtt_us orelse 25_000),
+        @as(i64, 50_000),
+        @as(i64, 250_000),
+    ) * std.time.ns_per_us;
+    if (!s.restoring and s.output_recv.gapExpired(now, reorder_timeout_ns)) {
+        return .err_output_stream_lost;
     }
+
+    flushReliable(s, now) catch return .err_send;
 
     // Heartbeat + delayed ACKs.
     if (s.ack_dirty and (now - s.last_ack_send_ns) >= ack_delay_ns) {
@@ -309,50 +387,40 @@ export fn zmosh_poll(session: ?*Session) Status {
 
         switch (packet.channel) {
             .heartbeat => {},
-            .control => {
+            .reliable_ipc, .control, .snapshot => {
                 s.ack_dirty = true;
-                if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
-            },
-            .reliable_ipc => {
-                s.ack_dirty = true;
-                if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
-
-                var offset: usize = 0;
-                while (offset < packet.payload.len) {
-                    const remaining = packet.payload[offset..];
-                    const msg_len = ipc.expectedLength(remaining) orelse break;
-                    if (remaining.len < msg_len) break;
-
-                    const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                    const payload = remaining[@sizeOf(ipc.Header)..msg_len];
-
-                    if (hdr.tag == .Output and payload.len > 0) {
-                        s.output_cb(s.ctx, payload.ptr, @intCast(payload.len));
-                    } else if (hdr.tag == .SessionEnd) {
-                        s.session_ended = true;
-                        if (s.end_cb) |cb| cb(s.ctx);
-                        return .ok;
-                    }
-
-                    offset += msg_len;
+                _ = s.reliable_recv.push(packet) catch return .err_poll;
+                while (s.reliable_recv.popReady()) |ready| {
+                    handleReliablePayload(s, ready.channel, ready.payload) catch |err| {
+                        ready.deinit();
+                        return if (err == error.OutputStreamLost) .err_output_stream_lost else .err_poll;
+                    };
+                    ready.deinit();
                 }
+                if (s.session_ended) return .ok;
             },
             .output => {
-                switch (s.output_recv.onPacket(packet.seq)) {
+                if (s.restoring) continue;
+                switch (s.output_recv.onPacket(packet.seq, packet.payload, now) catch return .err_poll) {
                     .accept => {
-                        if (packet.payload.len > 0) {
-                            s.output_cb(s.ctx, packet.payload.ptr, @intCast(packet.payload.len));
+                        var made_progress = false;
+                        while (s.output_recv.popReady()) |output| {
+                            if (output.len > 0) {
+                                s.output_cb(s.ctx, output.ptr, @intCast(output.len));
+                            }
+                            alloc.free(output);
+                            made_progress = true;
                         }
+                        s.output_recv.noteDrain(made_progress, now);
                     },
-                    .gap => {
-                        requestResync(s, now) catch {};
-                    },
+                    .gap => return .err_output_stream_lost,
                     .duplicate, .stale => {},
                 }
             },
         }
     }
 
+    flushReliable(s, now) catch return .err_send;
     return .ok;
 }
 
@@ -362,14 +430,15 @@ export fn zmosh_send_input(session: ?*Session, data: ?[*]const u8, len: u32) Sta
     if (len == 0) return .ok;
     if (len > max_input_len) return .err_too_large;
 
-    const now: i64 = @intCast(std.time.nanoTimestamp());
     const payload = d[0..len];
     var off: usize = 0;
     while (off < payload.len) {
         const end = @min(off + max_ipc_payload, payload.len);
-        sendIpcReliable(s, .Input, payload[off..end], now) catch return .err_send;
+        sendIpcReliable(s, .Input, payload[off..end]) catch return .err_send;
         off = end;
     }
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    flushReliable(s, now) catch return .err_send;
     return .ok;
 }
 
@@ -377,8 +446,20 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
     const s = session orelse return .err_null;
 
     const size = ipc.Resize{ .rows = rows, .cols = cols };
+    sendIpcReliable(s, .Resize, std.mem.asBytes(&size)) catch return .err_send;
     const now: i64 = @intCast(std.time.nanoTimestamp());
-    sendIpcReliable(s, .Resize, std.mem.asBytes(&size), now) catch return .err_send;
+    flushReliable(s, now) catch return .err_send;
+    return .ok;
+}
+
+export fn zmosh_restore(session: ?*Session, rows: u16, cols: u16) Status {
+    const s = session orelse return .err_null;
+
+    beginRestore(s);
+    const size = ipc.Resize{ .rows = rows, .cols = cols };
+    sendIpcReliable(s, .Restore, std.mem.asBytes(&size)) catch return .err_send;
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    flushReliable(s, now) catch return .err_send;
     return .ok;
 }
 
@@ -386,9 +467,13 @@ export fn zmosh_disconnect(session: ?*Session) void {
     const s = session orelse return;
 
     const now: i64 = @intCast(std.time.nanoTimestamp());
-    sendIpcReliable(s, .Detach, "", now) catch {};
+    sendIpcReliable(s, .Detach, "") catch {};
+    flushReliable(s, now) catch {};
 
+    s.snapshot.deinit();
+    s.output_recv.deinit();
+    s.reliable_recv.deinit();
     s.reliable_send.deinit();
     s.udp_sock.close();
-    std.heap.page_allocator.destroy(s);
+    alloc.destroy(s);
 }

@@ -8,15 +8,20 @@ Use spec: https://common-changelog.org/
 
 - New environment variable `ZMX_SESSION_PREFIX` which will be inserted before every session name for every command
 - New command `zmx wait` which will stale until all tasks (`zmx run`) are completed.
+- New command `zmosh preserve-scrollback` explicitly moves the visible screen into native terminal scrollback and clears it
+- New `attach --restore` option and `zmosh_restore` library call explicitly restore existing terminal state
 
 ### Changed
 
 - `zmx version` now returns the socket and log directory locations
 - `zmx run` now inserts a `ZMX_TASK_COMPLETED` marker after every run command to indicate when the task is completed and then returns the aggregate exit status
+- `zmx attach -r` now reports remote connect failures on stderr with the log file location and exits 2 instead of silently exiting 0, and exits 3 when an established connection is lost permanently
+- Attach and transport reconnects no longer synthesize screen clears, snapshots, status overlays, or terminal-mode resets
 
 ### Fixed
 
 - `libghostty` had a regression that caused `zmx` to crash
+- Full-screen application redraws no longer add repeated screenfuls to client scrollback
 
 ## v0.3.0 - 2026-02-01
 

@@ -14,6 +14,7 @@ pub const Tag = enum(u8) {
     Run = 9,
     Ack = 10,
     SessionEnd = 11,
+    Restore = 12,
 };
 
 pub const Header = packed struct {

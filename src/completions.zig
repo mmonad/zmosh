@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run serve detach list completions kill history version help"
+    \\  local commands="attach run serve detach list completions kill history preserve-scrollback version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,7 +37,11 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|serve|kill|history)
+    \\    attach)
+    \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
+    \\      COMPREPLY=($(compgen -W "--restore $sessions" -- "$cur"))
+    \\      ;;
+    \\    run|serve|kill|history)
     \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -78,6 +82,7 @@ const zsh_completions =
     \\        'kill:Kill a session'
     \\        'serve:Start UDP gateway for remote access'
     \\        'history:Output session scrollback'
+    \\        'preserve-scrollback:Move visible screen into scrollback and clear'
     \\        'version:Show version'
     \\        'help:Show help message'
     \\      )
@@ -85,7 +90,10 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|serve|s|history|hi)
+    \\        attach|a)
+    \\          _values 'attach option or session' '--restore[Restore existing terminal state]' $(zmosh list --short 2>/dev/null)
+    \\          ;;
+    \\        kill|k|run|r|serve|s|history|hi)
     \\          _zmosh_sessions
     \\          ;;
     \\        completions|c)
@@ -119,7 +127,7 @@ const zsh_completions =
 const fish_completions =
     \\complete -c zmosh -f
     \\
-    \\set -l subcommands attach run serve detach list completions kill history version help
+    \\set -l subcommands attach run serve detach list completions kill history preserve-scrollback version help
     \\set -l no_subcmd "not __fish_seen_subcommand_from $subcommands"
     \\
     \\complete -c zmosh -n $no_subcmd -a attach -d 'Attach to session, creating if needed'
@@ -130,8 +138,11 @@ const fish_completions =
     \\complete -c zmosh -n $no_subcmd -a serve -d 'Start UDP gateway for remote access'
     \\complete -c zmosh -n $no_subcmd -a kill -d 'Kill a session'
     \\complete -c zmosh -n $no_subcmd -a history -d 'Output session scrollback'
+    \\complete -c zmosh -n $no_subcmd -a preserve-scrollback -d 'Move visible screen into scrollback and clear'
     \\complete -c zmosh -n $no_subcmd -a version -d 'Show version'
     \\complete -c zmosh -n $no_subcmd -a help -d 'Show help message'
+    \\
+    \\complete -c zmosh -n "__fish_seen_subcommand_from attach" -l restore -d 'Restore existing terminal state'
     \\
     \\complete -c zmosh -n "__fish_seen_subcommand_from attach run serve kill history" -a '(zmosh list --short 2>/dev/null)' -d 'Session name'
     \\

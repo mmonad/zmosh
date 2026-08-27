@@ -12,6 +12,7 @@ const remote = @import("remote.zig");
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
 pub const ghostty_version = build_options.ghostty_version;
+const preserve_scrollback_sequence = "\x1b[22J";
 
 var log_system = log.LogSystem{};
 
@@ -141,7 +142,6 @@ const Daemon = struct {
     pid: i32,
     command: ?[]const []const u8 = null,
     cwd: []const u8 = "",
-    has_pty_output: bool = false,
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
@@ -190,36 +190,11 @@ const Daemon = struct {
         pty_fd: i32,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
+        restore: bool,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-
-        // Serialize terminal state BEFORE resize to capture the pre-reflow
-        // cursor position. We gate on has_pty_output so that the very first
-        // local attach (where the shell hasn't emitted anything yet) skips
-        // the snapshot, while a remote attach — where the shell may have been
-        // running since the gateway forked the daemon — gets a full replay.
-        if (self.has_pty_output) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
-            if (serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                defer self.alloc.free(term_output);
-                // Only clear on re-init. For first Init on a fresh socket,
-                // write_buf may contain queued non-Output replies (e.g. Info)
-                // from earlier messages in the same read batch.
-                if (client.initialized) {
-                    // Drop any stale output buffered before Init so the snapshot
-                    // is the first payload rendered after a resync request.
-                    client.write_buf.clearRetainingCapacity();
-                }
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
-                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
-                };
-                client.has_pending_output = true;
-            }
-        }
 
         var ws: c.struct_winsize = .{
             .ws_row = resize.rows,
@@ -229,6 +204,30 @@ const Daemon = struct {
         };
         _ = c.ioctl(pty_fd, c.TIOCSWINSZ, &ws);
         try term.resize(self.alloc, resize.cols, resize.rows);
+
+        // A terminal snapshot is synthetic output. Send one only when the
+        // attaching client explicitly asks to restore the existing screen.
+        if (restore) {
+            const cursor = &term.screens.active.cursor;
+            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
+            if (serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
+                std.log.debug("serialize terminal state", .{});
+                defer self.alloc.free(term_output);
+                // Only clear on a repeated restore. For the first request on a
+                // fresh socket,
+                // write_buf may contain queued non-Output replies (e.g. Info)
+                // from earlier messages in the same read batch.
+                if (client.initialized) {
+                    // Drop stale output buffered before Restore so the requested
+                    // snapshot is the first payload rendered.
+                    client.write_buf.clearRetainingCapacity();
+                }
+                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
+                };
+                client.has_pending_output = true;
+            }
+        }
 
         client.initialized = true;
 
@@ -371,6 +370,8 @@ pub fn main() !void {
         return printVersion(&cfg);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help();
+    } else if (std.mem.eql(u8, cmd, "preserve-scrollback")) {
+        return preserveScrollback();
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
         return list(&cfg, short);
@@ -403,12 +404,15 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var session_name: []const u8 = "";
         var remote_host: ?[]const u8 = null;
+        var restore = false;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
                 remote_host = args.next();
+            } else if (session_name.len == 0 and std.mem.eql(u8, arg, "--restore")) {
+                restore = true;
             } else if (session_name.len == 0) {
                 session_name = arg;
             } else {
@@ -421,11 +425,33 @@ pub fn main() !void {
 
         // Remote attach via encrypted UDP
         if (remote_host) |host| {
-            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+            const command = if (command_args.items.len > 0) command_args.items else null;
+            const session = remote.connectRemote(alloc, host, sesh, command) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
-                return;
+                // std.log goes to the log file; a kitty --hold tab or a
+                // scripted caller needs the failure on stderr and a
+                // non-zero exit, distinct from a normal detach.
+                var msg_buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "zmx: remote connect to {s} failed: {s} (see {s}/zmx.log)\n",
+                    .{ host, @errorName(err), cfg.log_dir },
+                ) catch "zmx: remote connect failed\n";
+                _ = posix.write(posix.STDERR_FILENO, msg) catch {};
+                std.process.exit(2);
             };
-            return remote.remoteAttach(alloc, session);
+            remote.remoteAttach(alloc, session, restore) catch |err| switch (err) {
+                error.ConnectionLost, error.OutputStreamLost => {
+                    const message = if (err == error.ConnectionLost)
+                        "zmx: connection lost\n"
+                    else
+                        "zmx: terminal output stream lost; reconnect with --restore\n";
+                    _ = posix.write(posix.STDERR_FILENO, message) catch {};
+                    std.process.exit(3);
+                },
+                else => return err,
+            };
+            return;
         }
 
         // Local attach (existing behavior)
@@ -452,9 +478,12 @@ pub fn main() !void {
         };
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon);
+        return attach(&daemon, restore);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        while (args.next()) |arg| try command_args.append(alloc, arg);
         const sesh = try getSeshName(alloc, session_name);
         defer alloc.free(sesh);
 
@@ -470,7 +499,7 @@ pub fn main() !void {
             .session_name = sesh,
             .socket_path = undefined,
             .pid = undefined,
-            .command = null,
+            .command = if (command_args.items.len > 0) command_args.items else null,
             .cwd = cwd,
             .created_at = @intCast(std.time.nanoTimestamp()),
         };
@@ -563,6 +592,17 @@ fn printCompletions(shell: completions.Shell) !void {
     try w.interface.flush();
 }
 
+fn preserveScrollback() !void {
+    var buf: [8]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try writePreserveScrollback(&w.interface);
+    try w.interface.flush();
+}
+
+fn writePreserveScrollback(writer: *std.Io.Writer) !void {
+    try writer.writeAll(preserve_scrollback_sequence);
+}
+
 fn help() !void {
     const help_text =
         \\zmosh - session persistence for terminal processes
@@ -570,8 +610,8 @@ fn help() !void {
         \\Usage: zmosh <command> [args]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
-        \\  [a]ttach -r <host> <name>      Attach to remote session via UDP
+        \\  [a]ttach [--restore] <name> [command...]  Attach without repainting by default
+        \\  [a]ttach -r <host> [--restore] <name> [command...]  Attach remotely without repainting
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [s]erve <name>                 Start UDP gateway for remote access
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
@@ -580,6 +620,7 @@ fn help() !void {
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [w]ait <name>...               Wait for session tasks to complete
+        \\  preserve-scrollback            Move the visible screen into scrollback and clear
         \\  [v]ersion                      Show version information
         \\  [h]elp                         Show this help message
         \\
@@ -933,11 +974,11 @@ fn ensureSession(daemon: *Daemon) !EnsureSessionResult {
             defer daemon.alloc.free(session_log_path);
             try log_system.init(daemon.alloc, session_log_path);
 
-            errdefer {
+            const pty_fd = spawnPty(daemon) catch |err| {
                 posix.close(server_sock_fd);
                 dir.deleteFile(daemon.session_name) catch {};
-            }
-            const pty_fd = try spawnPty(daemon);
+                return err;
+            };
             defer {
                 posix.close(pty_fd);
                 posix.close(server_sock_fd);
@@ -960,7 +1001,7 @@ fn ensureSession(daemon: *Daemon) !EnsureSessionResult {
     return .{ .created = false, .is_daemon = false };
 }
 
-fn attach(daemon: *Daemon) !void {
+fn attach(daemon: *Daemon, restore: bool) !void {
     if (std.posix.getenv("ZMX_SESSION")) |_| {
         return error.CannotAttachToSessionInSession;
     }
@@ -982,19 +1023,6 @@ fn attach(daemon: *Daemon) !void {
     // Use TCSAFLUSH to discard any unread input, preventing stale input after detach.
     defer {
         _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSAFLUSH, &orig_termios);
-        // Reset terminal modes on detach:
-        // - Mouse: 1000=basic, 1002=button-event, 1003=any-event, 1006=SGR extended
-        // - 2004=bracketed paste, 1004=focus events, 1049=alt screen
-        // - 25h=show cursor
-        // NOTE: We don't enter alt screen on attach, but the inner session
-        // (vim, less, etc.) may have set it, so we must still reset it here.
-        const restore_seq = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" ++
-            "\x1b[?2004l\x1b[?1004l\x1b[?1049l" ++
-            // Restore pre-attach Kitty keyboard protocol mode so Ctrl combos
-            // return to legacy encoding in the user's outer shell.
-            "\x1b[<u" ++
-            "\x1b[?25h";
-        _ = posix.write(posix.STDOUT_FILENO, restore_seq) catch {};
     }
 
     var raw_termios = orig_termios;
@@ -1013,14 +1041,7 @@ fn attach(daemon: *Daemon) !void {
 
     _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &raw_termios);
 
-    // Clear screen before attaching to provide a clean slate for the
-    // session snapshot. We intentionally do NOT use the alternate screen
-    // (\x1b[?1049h) because it has no scrollback buffer, which would
-    // prevent the user from scrolling back through session history.
-    const enter_attach_seq = "\x1b[2J\x1b[H";
-    _ = try posix.write(posix.STDOUT_FILENO, enter_attach_seq);
-
-    try clientLoop(daemon.cfg, client_sock);
+    try clientLoop(daemon.cfg, client_sock, restore);
 }
 
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
@@ -1124,7 +1145,7 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     return error.NoAckReceived;
 }
 
-fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
+fn clientLoop(_: *Cfg, client_sock_fd: i32, restore: bool) !void {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -1141,7 +1162,8 @@ fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
 
     // Send init message with terminal size (buffered)
     const size = getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    const init_tag: ipc.Tag = if (restore) .Restore else .Init;
+    try ipc.appendMessage(alloc, &sock_write_buf, init_tag, std.mem.asBytes(&size));
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -1318,10 +1340,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
-    var vt_stream: ghostty_vt.Stream(ScrollPreservingHandler) = .initAlloc(
-        daemon.alloc,
-        ScrollPreservingHandler.init(&term),
-    );
+    var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
     daemon_loop: while (daemon.running) {
@@ -1392,10 +1411,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
-                    vt_stream.handler.clear_detected = false;
                     try vt_stream.nextSlice(buf[0..n]);
-                    daemon.has_pty_output = true;
-
                     // In run mode, scan output for exit code marker
                     if (daemon.is_task_mode and daemon.task_exit_code == null) {
                         if (findTaskExitMarker(buf[0..n])) |exit_code| {
@@ -1412,13 +1428,6 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     // should only receive explicit replies (Ack/History/Info).
                     for (daemon.clients.items) |client| {
                         if (!client.initialized) continue;
-                        // If ESC[2J was detected, prepend ESC[22J (scroll_complete)
-                        // so the client terminal pushes screen content to scrollback
-                        // before clearing. Terminals that don't support 22J ignore it
-                        // and the original ESC[2J in buf still clears the screen.
-                        if (vt_stream.handler.clear_detected) {
-                            ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, "\x1b[22J") catch {};
-                        }
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
                             std.log.warn("failed to buffer output for client err={s}", .{@errorName(err)});
                             continue;
@@ -1463,7 +1472,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(pty_fd, msg.payload),
-                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload, false),
+                        .Restore => try daemon.handleInit(client, pty_fd, &term, msg.payload, true),
                         .Resize => try daemon.handleResize(pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);
@@ -1762,39 +1772,6 @@ fn isKittyCtrlBackslash(buf: []const u8) bool {
         std.mem.indexOf(u8, buf, "\x1b[92;5:1u") != null;
 }
 
-/// A VT stream handler that detects ESC[2J (erase display complete) on the
-/// primary screen and sets a flag so the daemon can prepend a scroll-preserving
-/// sequence (ESC[22J) to client output before forwarding the raw bytes.
-///
-/// Also calls scrollClear() on the server-side VT as a safety net for shells
-/// without OSC 133 prompt annotations, where ghostty's built-in heuristic
-/// would skip scrollback preservation.
-const ScrollPreservingHandler = struct {
-    terminal: *ghostty_vt.Terminal,
-    clear_detected: bool = false,
-
-    pub fn init(terminal: *ghostty_vt.Terminal) ScrollPreservingHandler {
-        return .{ .terminal = terminal };
-    }
-
-    pub fn deinit(_: *ScrollPreservingHandler) void {}
-
-    pub fn vt(
-        self: *ScrollPreservingHandler,
-        comptime action: ghostty_vt.StreamAction.Tag,
-        value: ghostty_vt.StreamAction.Value(action),
-    ) !void {
-        if (comptime action == .erase_display_complete) {
-            if (self.terminal.screens.active_key == .primary) {
-                self.terminal.screens.active.scrollClear() catch {};
-                self.clear_detected = true;
-            }
-        }
-        var handler = self.terminal.vtHandler();
-        return handler.vt(action, value);
-    }
-};
-
 fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -1901,12 +1878,82 @@ fn serializeTerminal(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, forma
     };
 }
 
+test "session persists and stays attachable after its last client disconnects" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const socket_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(socket_dir);
+    const log_dir = try std.fs.path.join(alloc, &.{ socket_dir, "logs" });
+    defer alloc.free(log_dir);
+
+    var cfg = Cfg{ .socket_dir = socket_dir, .log_dir = log_dir };
+    try cfg.mkdir();
+
+    const sesh = "regress-gateway-gone";
+    const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+    const command: []const []const u8 = &.{ "sleep", "600" };
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = sesh,
+        .socket_path = undefined,
+        .pid = undefined,
+        .command = command,
+        .cwd = socket_dir,
+        .created_at = @intCast(std.time.nanoTimestamp()),
+    };
+    daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, sesh);
+    defer alloc.free(daemon.socket_path);
+    defer daemon.clients.deinit(alloc);
+
+    const result = try ensureSession(&daemon);
+    // The forked daemon child only returns here after the session is
+    // killed; it must not continue running the test binary.
+    if (result.is_daemon) posix.exit(0);
+    try std.testing.expect(result.created);
+
+    // A probe of the fresh session reports zero attached clients.
+    const probe1 = try probeSession(alloc, daemon.socket_path);
+    posix.close(probe1.fd);
+    try std.testing.expectEqual(@as(usize, 0), probe1.info.clients_len);
+
+    // Simulate a remote gateway: connect as a client, then vanish
+    // without sending Detach, like a dropped SSH bootstrap.
+    const gateway_fd = try sessionConnect(daemon.socket_path);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    posix.close(gateway_fd);
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // The daemon must still be alive, attachable, and back to zero clients.
+    const probe2 = try probeSession(alloc, daemon.socket_path);
+    posix.close(probe2.fd);
+    try std.testing.expectEqual(@as(usize, 0), probe2.info.clients_len);
+
+    // Cleanup: kill the session and reap the forked daemon child.
+    const kill_fd = try sessionConnect(daemon.socket_path);
+    try ipc.send(kill_fd, .Kill, "");
+    posix.close(kill_fd);
+    _ = posix.waitpid(-1, 0);
+}
+
 test "isKittyCtrlBackslash" {
     try std.testing.expect(isKittyCtrlBackslash("\x1b[92;5u"));
     try std.testing.expect(isKittyCtrlBackslash("\x1b[92;5:1u"));
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;5:3u"));
     try std.testing.expect(!isKittyCtrlBackslash("\x1b[92;1u"));
     try std.testing.expect(!isKittyCtrlBackslash("garbage"));
+}
+
+test "preserve scrollback emits explicit scroll clear" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try writePreserveScrollback(&output.writer);
+    try std.testing.expectEqualStrings("\x1b[22J", output.writer.buffered());
 }
 
 test "writeSessionLine formats output for current session and short output" {

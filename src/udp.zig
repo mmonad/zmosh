@@ -112,6 +112,8 @@ pub const Peer = struct {
     // Sequence numbers
     send_seq: u63,
     max_recv_seq: u63,
+    recv_mask: u64,
+    has_recv_seq: bool,
 
     // RTT estimation (RFC 6298, 50ms min RTO like Mosh)
     srtt_us: ?i64,
@@ -135,6 +137,8 @@ pub const Peer = struct {
             .key = key,
             .send_seq = 0,
             .max_recv_seq = 0,
+            .recv_mask = 0,
+            .has_recv_seq = false,
             .srtt_us = null,
             .rttvar_us = null,
             .last_send_time = null,
@@ -169,61 +173,80 @@ pub const Peer = struct {
     /// Try to receive and decrypt a datagram. Updates peer address on success (roaming).
     /// Returns null if no data available (EAGAIN) or decryption fails.
     pub fn recv(self: *Peer, sock: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
-        var raw: [9000]u8 = undefined;
-        const result = sock.recvFrom(&raw) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            else => return err,
-        };
+        while (true) {
+            var raw: [9000]u8 = undefined;
+            const result = sock.recvFrom(&raw) catch |err| switch (err) {
+                error.WouldBlock => return null,
+                else => return err,
+            };
 
-        // Determine expected direction: if we send to_server, we receive to_client
-        const recv_direction: crypto.Direction = switch (self.direction) {
-            .to_server => .to_client,
-            .to_client => .to_server,
-        };
+            // Determine expected direction: if we send to_server, we receive to_client
+            const recv_direction: crypto.Direction = switch (self.direction) {
+                .to_server => .to_client,
+                .to_client => .to_server,
+            };
 
-        const decoded = crypto.decodeDatagram(
-            self.key,
-            recv_direction,
-            raw[0..result.len],
-            buf,
-        ) catch |err| {
-            log.debug("decrypt failed: {s}", .{@errorName(err)});
-            return null;
-        };
+            const decoded = crypto.decodeDatagram(
+                self.key,
+                recv_direction,
+                raw[0..result.len],
+                buf,
+            ) catch |err| {
+                log.debug("decrypt failed: {s}", .{@errorName(err)});
+                continue;
+            };
 
-        const now = nanoNow();
+            const now = nanoNow();
+            var newest = false;
 
-        // Anti-replay + roaming: only update state if seq > max_recv_seq.
-        // Old or duplicate packets are dropped after authentication.
-        if (decoded.seq > self.max_recv_seq) {
-            self.addr = result.addr;
-            self.max_recv_seq = decoded.seq;
-            self.last_recv_time = now;
-
-            // RTT measurement
-            if (self.last_send_time) |send_time| {
-                const rtt_ns = now - send_time;
-                if (rtt_ns > 0) {
-                    self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
+            // Keep a 64-datagram authenticated anti-replay window. Recent
+            // out-of-order packets are valid transport input, but only a new
+            // maximum sequence may move the roaming address to another peer.
+            if (!self.has_recv_seq) {
+                self.has_recv_seq = true;
+                self.max_recv_seq = decoded.seq;
+                self.recv_mask = 1;
+                self.addr = result.addr;
+                newest = true;
+            } else if (decoded.seq > self.max_recv_seq) {
+                const shift = decoded.seq - self.max_recv_seq;
+                self.recv_mask = if (shift >= 64) 1 else (self.recv_mask << @intCast(shift)) | 1;
+                self.max_recv_seq = decoded.seq;
+                self.addr = result.addr;
+                newest = true;
+            } else {
+                const diff = self.max_recv_seq - decoded.seq;
+                if (diff >= 64) {
+                    log.debug("stale seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
+                    continue;
                 }
-                self.last_send_time = null;
+                const bit = @as(u64, 1) << @intCast(diff);
+                if (self.recv_mask & bit != 0) {
+                    log.debug("duplicate seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
+                    continue;
+                }
+                self.recv_mask |= bit;
             }
-        } else if (decoded.seq == 0 and self.max_recv_seq == 0) {
-            // First packet (seq 0)
-            self.addr = result.addr;
-            self.max_recv_seq = 0;
             self.last_recv_time = now;
-        } else {
-            log.debug("old seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
-            return null;
-        }
 
-        if (self.state == .disconnected) {
-            self.state = .connected;
-            log.info("peer reconnected", .{});
-        }
+            if (newest) {
+                // RTT measurement
+                if (self.last_send_time) |send_time| {
+                    const rtt_ns = now - send_time;
+                    if (rtt_ns > 0) {
+                        self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
+                    }
+                    self.last_send_time = null;
+                }
+            }
 
-        return .{ .data = decoded.plaintext, .from = result.addr };
+            if (self.state == .disconnected) {
+                self.state = .connected;
+                log.info("peer reconnected", .{});
+            }
+
+            return .{ .data = decoded.plaintext, .from = result.addr };
+        }
     }
 
     /// Check if a heartbeat should be sent.
@@ -331,7 +354,7 @@ test "Peer send/recv round-trip (loopback)" {
     try std.testing.expectEqualStrings(msg, recv_result.?.data);
 }
 
-test "Anti-replay: reject datagram with seq <= max_recv_seq" {
+test "Anti-replay window accepts a reordered datagram exactly once" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -356,16 +379,46 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
     try std.testing.expect(r1 != null);
     try std.testing.expect(peer.max_recv_seq == 10);
 
-    // Send lower seq — packet is dropped.
+    // A recent lower sequence is accepted without rolling back peer state.
     const old_port = peer.addr.?.getPort();
     try sock_send.sendTo(pkt_lo, target);
     try testPollReady(sock_recv.fd);
 
     var recv_buf2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &recv_buf2);
-    try std.testing.expect(r2 == null);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("first", r2.?.data);
     try std.testing.expect(peer.max_recv_seq == 10);
     try std.testing.expect(peer.addr.?.getPort() == old_port);
+
+    // The same authenticated datagram cannot be replayed.
+    try sock_send.sendTo(pkt_lo, target);
+    try testPollReady(sock_recv.fd);
+    var recv_buf3: [4096]u8 = undefined;
+    try std.testing.expect(try peer.recv(&sock_recv, &recv_buf3) == null);
+}
+
+test "Anti-replay window rejects packets older than 64 datagrams" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60980, 60990);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(60990, 61000);
+    defer sock_send.close();
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var new_buf: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 100, "new", &new_buf), target);
+    try testPollReady(sock_recv.fd);
+    var recv_new: [4096]u8 = undefined;
+    try std.testing.expect(try peer.recv(&sock_recv, &recv_new) != null);
+
+    var stale_buf: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 36, "stale", &stale_buf), target);
+    try testPollReady(sock_recv.fd);
+    var recv_stale: [4096]u8 = undefined;
+    try std.testing.expect(try peer.recv(&sock_recv, &recv_stale) == null);
 }
 
 test "Roaming: verify addr updates on authentic packet" {

@@ -22,6 +22,7 @@ typedef enum {
     ZMOSH_ERR_NULL        = 7,
     ZMOSH_ERR_SEND        = 8,
     ZMOSH_ERR_TOO_LARGE   = 9,
+    ZMOSH_ERR_OUTPUT_STREAM_LOST = 10,
 } zmosh_status_t;
 
 /* Max bytes per zmosh_send_input call (8192). */
@@ -88,6 +89,10 @@ zmosh_status_t zmosh_send_input(zmosh_session_t *session,
 /* Notify the remote session of a terminal resize. */
 zmosh_status_t zmosh_resize(zmosh_session_t *session,
                             uint16_t rows, uint16_t cols);
+
+/* Explicitly request restoration of the existing terminal state. */
+zmosh_status_t zmosh_restore(zmosh_session_t *session,
+                             uint16_t rows, uint16_t cols);
 
 /* Disconnect and free all resources. Handle is invalid after this call. */
 void zmosh_disconnect(zmosh_session_t *session);

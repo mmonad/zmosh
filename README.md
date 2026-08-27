@@ -124,6 +124,9 @@ zmosh_poll(session);
 zmosh_send_input(session, data, len);
 zmosh_resize(session, rows, cols);
 
+// Explicitly restore existing terminal state when this is a new display
+zmosh_restore(session, rows, cols);
+
 // Cleanup
 zmosh_disconnect(session);
 ```
@@ -144,8 +147,8 @@ zig build xcframework
 Usage: zmosh <command> [args]
 
 Commands:
-  [a]ttach <name> [command...]   Attach to session, creating session if needed
-  [a]ttach -r <host> <name>      Attach to remote session via UDP
+  [a]ttach [--restore] <name> [command...]  Attach without repainting by default
+  [a]ttach -r <host> [--restore] <name>     Attach remotely without repainting
   [r]un <name> [command...]      Send command without attaching, creating session if needed
   [s]erve <name>                 Start UDP gateway for remote access
   [d]etach                       Detach all clients from current session (ctrl+\ for current client)
@@ -154,6 +157,7 @@ Commands:
   [k]ill <name>                  Kill a session and all attached clients
   [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
   [w]ait <name>...               Wait for session tasks to complete
+  preserve-scrollback            Move the visible screen into scrollback and clear
   [v]ersion                      Show version information
   [h]elp                         Show this help message
 ```
@@ -162,9 +166,11 @@ Commands:
 
 ```bash
 zmosh attach dev              # start a shell session
+zmosh attach --restore dev    # explicitly restore an existing screen in a new terminal
 zmosh a dev nvim .            # start nvim in a persistent session
 zmosh attach build make -j8   # run a build, reattach to check progress
 zmosh attach mux dvtm         # run a multiplexer inside zmosh
+zmosh preserve-scrollback     # explicitly move the visible screen into native scrollback and clear
 
 zmosh run dev cat README.md   # run the command without attaching to the session
 zmosh r dev cat CHANGELOG.md  # alias
@@ -181,6 +187,9 @@ zmosh wait tests              # waits for tests to complete
 # (bootstraps via SSH, then switches to UDP)
 zmosh attach -r myserver dev
 
+# explicitly restore existing state into a new local terminal
+zmosh attach -r myserver --restore dev
+
 # short form
 zmosh a -r myserver dev
 
@@ -192,7 +201,9 @@ The remote workflow:
 1. zmosh SSHs into `<host>` and runs `zmosh serve <session>`
 2. The remote gateway binds a UDP port and prints a connect line with the session key
 3. zmosh reads the key, closes the SSH pipes, and switches to encrypted UDP
-4. If your network drops, the client shows a status bar and reconnects automatically when connectivity returns
+4. If the network drops, ordered terminal bytes resume without a synthesized repaint
+
+Attach never clears or restores the terminal automatically. A new terminal receives only future PTY bytes unless `--restore` is supplied explicitly.
 
 ## shell prompt
 

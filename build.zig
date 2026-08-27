@@ -161,8 +161,14 @@ pub fn build(b: *std.Build) void {
             .root_module = lib_mod,
         });
         lib.bundle_compiler_rt = true;
+        const lib_unit_tests = b.addTest(.{
+            .root_module = lib_mod,
+        });
+        const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
         const install_lib = b.addInstallArtifact(lib, .{});
         const install_header = b.addInstallFile(b.path("include/zmosh/zmosh.h"), "include/zmosh/zmosh.h");
+        test_step.dependOn(&run_lib_unit_tests.step);
+        check.dependOn(&lib.step);
         lib_step.dependOn(&install_lib.step);
         lib_step.dependOn(&install_header.step);
     }
