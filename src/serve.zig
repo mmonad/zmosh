@@ -1,542 +1,430 @@
+//! UDP gateway for the current core daemon's native IPC.
 const std = @import("std");
-const posix = std.posix;
+const zmx = @import("libzmx");
+const p = @import("posix.zig");
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
-const ipc = @import("ipc.zig");
-const transport = @import("transport.zig");
+const link_mod = @import("link.zig");
+const wire = @import("wire.zig");
+const runtime = @import("runtime.zig");
 
-const log = std.log.scoped(.serve);
+const pause_high = 768 * 1024;
+const pause_low = 512 * 1024;
+const pause_timeout = 2 * std.time.ns_per_s;
 
-const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
-const max_unix_write_buf = 1024 * 1024;
-const max_output_coalesce = 256 * 1024;
-const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
-
-var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    sigterm_received.store(true, .release);
-}
-
-fn setupSigtermHandler() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSigterm },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.SIGINFO,
-    };
-    posix.sigaction(posix.SIG.TERM, &act, null);
-}
-
-/// Resolve the zmx socket directory, following the same logic as main.zig's Cfg.init.
-fn resolveSocketDir(alloc: std.mem.Allocator) ![]const u8 {
-    if (posix.getenv("ZMX_DIR")) |zmxdir|
-        return try alloc.dupe(u8, zmxdir);
-    const tmpdir = std.mem.trimRight(u8, posix.getenv("TMPDIR") orelse "/tmp", "/");
-    const uid = posix.getuid();
-    if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime|
-        return try std.fmt.allocPrint(alloc, "{s}/zmx", .{xdg_runtime});
-    return try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, uid });
-}
-
-/// Connect to the daemon's Unix socket (same as sessionConnect in main.zig).
-fn connectUnix(path: []const u8) !i32 {
-    var unix_addr = try std.net.Address.initUnix(path);
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &unix_addr.any, unix_addr.getOsSockLen());
-    // Make non-blocking for poll loop
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.SOCK.NONBLOCK);
-    return fd;
-}
-
-pub const Gateway = struct {
+const Gateway = struct {
+    const Phase = enum { awaiting_init, priming, streaming };
+    phase: Phase = .awaiting_init,
+    prime_started: i64 = 0,
     alloc: std.mem.Allocator,
-    udp_sock: udp.UdpSocket,
-    unix_fd: i32,
-    peer: udp.Peer,
-    unix_read_buf: ipc.SocketBuffer,
-    unix_write_buf: std.ArrayList(u8),
-    output_coalesce_buf: std.ArrayList(u8),
+    link: *link_mod.Link,
+    frame: wire.NativeFrame = .{},
+    output_cursor: usize = 0,
+    native: link_mod.Queue = .{},
+    size: ?zmx.ipc.Resize = null,
+    resize_requested: bool = false,
+    detached: bool = false,
+    eof: bool = false,
+    ended: bool = false,
+    end_started: ?i64 = null,
+    paused_since: ?i64 = null,
+    native_progress: i64,
+    session: []const u8 = "",
 
-    reliable_send: transport.ReliableSend,
-    reliable_recv: transport.RecvState,
-    output_seq: u32,
-
-    config: udp.Config,
-    running: bool,
-
-    last_output_flush_ns: i64,
-    last_ack_send_ns: i64,
-    ack_dirty: bool,
-
-    last_resync_request_ns: i64,
-    have_client_size: bool,
-    last_resize: ipc.Resize,
-
-    pub fn init(
-        alloc: std.mem.Allocator,
-        session_name: []const u8,
-        config: udp.Config,
-    ) !Gateway {
-        const socket_dir = try resolveSocketDir(alloc);
-        defer alloc.free(socket_dir);
-
-        const socket_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ socket_dir, session_name });
-        defer alloc.free(socket_path);
-
-        // Connect to the daemon's Unix socket
-        const unix_fd = connectUnix(socket_path) catch |err| {
-            log.err("failed to connect to daemon socket={s} err={s}", .{ socket_path, @errorName(err) });
-            return err;
-        };
-        errdefer posix.close(unix_fd);
-
-        // Bind a UDP socket in the configured port range
-        var udp_sock = try udp.UdpSocket.bind(config.port_range_start, config.port_range_end);
-        errdefer udp_sock.close();
-
-        // Generate session key
-        const key = crypto.generateKey();
-        const encoded_key = crypto.keyToBase64(key);
-
-        // Print bootstrap line for SSH capture
-        {
-            var out_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
-            _ = try posix.write(posix.STDOUT_FILENO, line);
-        }
-
-        // Close stdout so SSH session can terminate
-        posix.close(posix.STDOUT_FILENO);
-
-        // Initialize peer (we send to_client, recv to_server from remote client)
-        const peer = udp.Peer.init(key, .to_client);
-
-        const unix_read_buf = try ipc.SocketBuffer.init(alloc);
-        const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-        const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-        const reliable_send = try transport.ReliableSend.init(alloc);
-
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-
-        log.info("gateway started session={s} udp_port={d}", .{ session_name, udp_sock.bound_port });
-
-        return .{
-            .alloc = alloc,
-            .udp_sock = udp_sock,
-            .unix_fd = unix_fd,
-            .peer = peer,
-            .unix_read_buf = unix_read_buf,
-            .unix_write_buf = unix_write_buf,
-            .output_coalesce_buf = output_coalesce_buf,
-            .reliable_send = reliable_send,
-            .reliable_recv = .{},
-            .output_seq = 1,
-            .config = config,
-            .running = true,
-            .last_output_flush_ns = now,
-            .last_ack_send_ns = now,
-            .ack_dirty = false,
-            .last_resync_request_ns = 0,
-            .have_client_size = false,
-            .last_resize = .{ .rows = 24, .cols = 80 },
-        };
+    fn deinit(self: *Gateway) void {
+        self.frame.deinit(self.alloc);
+        self.native.deinit(self.alloc);
     }
 
-    pub fn run(self: *Gateway) !void {
-        setupSigtermHandler();
-
-        while (self.running) {
-            if (sigterm_received.swap(false, .acq_rel)) {
-                log.info("SIGTERM received, shutting down gateway", .{});
-                break;
-            }
-
-            const now: i64 = @intCast(std.time.nanoTimestamp());
-
-            // Check peer state
-            const state = self.peer.updateState(now, self.config);
-            if (state == .dead) {
-                log.info("peer dead (alive timeout), shutting down", .{});
-                break;
-            }
-
-            try self.flushRetransmits(now);
-            try self.flushOutput(now, false);
-
-            if (self.peer.addr != null) {
-                if (self.ack_dirty and (now - self.last_ack_send_ns >= ack_delay_ns)) {
-                    self.sendHeartbeat(now) catch |err| {
-                        if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
-                    };
-                } else if (self.peer.shouldSendHeartbeat(now, self.config)) {
-                    self.sendHeartbeat(now) catch |err| {
-                        if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
-                    };
-                }
-            }
-
-            // Build poll fds
-            var poll_fds: [2]posix.pollfd = undefined;
-            poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
-
-            var unix_events: i16 = posix.POLL.IN;
-            if (self.unix_write_buf.items.len > 0) {
-                unix_events |= posix.POLL.OUT;
-            }
-            poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
-
-            const poll_timeout = self.computePollTimeoutMs(now);
-            _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
-                if (err == error.Interrupted) continue;
-                return err;
-            };
-
-            // Handle incoming UDP datagrams → decrypt → decode transport packet
-            if (poll_fds[0].revents & posix.POLL.IN != 0) {
-                while (true) {
-                    var decrypt_buf: [9000]u8 = undefined;
-                    const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
-                    const result = recv_result orelse break;
-                    try self.handleTransportPacket(result.data, now);
-                }
-            }
-
-            // Handle Unix socket read → forward to UDP transport
-            if (poll_fds[1].revents & posix.POLL.IN != 0) {
-                while (true) {
-                    const n = self.unix_read_buf.read(self.unix_fd) catch |err| {
-                        if (err == error.WouldBlock) break;
-                        log.warn("unix read error: {s}", .{@errorName(err)});
-                        self.running = false;
-                        break;
-                    };
-                    if (!self.running) break;
-                    if (n == 0) {
-                        log.info("daemon closed connection", .{});
-                        self.running = false;
-                        break;
-                    }
-
-                    while (self.unix_read_buf.next()) |msg| {
-                        try self.forwardDaemonMessage(msg.header.tag, msg.payload, now);
-                    }
-                }
-            }
-
-            // Flush buffered writes to Unix socket
-            if (poll_fds[1].revents & posix.POLL.OUT != 0) {
-                if (self.unix_write_buf.items.len > 0) {
-                    const written = posix.write(self.unix_fd, self.unix_write_buf.items) catch |err| blk: {
-                        if (err == error.WouldBlock) break :blk @as(usize, 0);
-                        log.warn("unix write error: {s}", .{@errorName(err)});
-                        self.running = false;
-                        break :blk @as(usize, 0);
-                    };
-                    if (written > 0) {
-                        self.unix_write_buf.replaceRange(self.alloc, 0, written, &[_]u8{}) catch unreachable;
-                    }
-                }
-            }
-
-            if (poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-                log.info("unix socket closed/error", .{});
-                break;
-            }
-        }
-
-        // Notify client that the session has ended.
-        if (self.peer.addr != null) {
-            self.sendIpcReliable(.SessionEnd, "", @intCast(std.time.nanoTimestamp())) catch |err| {
-                log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
-            };
-        }
+    fn appendRemote(self: *Gateway, msg: wire.Message) !bool {
+        // Translation may append native + legacy size records. Reserve the
+        // worst case before translating, then retain the whole result.
+        if (self.native.room() < msg.data.len + 32) return false;
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(self.alloc);
+        try wire.appendNative(self.alloc, &encoded, msg);
+        try self.native.append(self.alloc, encoded.items);
+        if (msg.tag == .Init or msg.tag == .Resize) self.size = try wire.decodeSize(msg.data);
+        if (msg.tag == .Detach) self.detached = true;
+        return true;
     }
 
-    fn computePollTimeoutMs(self: *const Gateway, now: i64) i32 {
-        var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
-
-        if (self.output_coalesce_buf.items.len > 0) {
-            const flush_due = self.last_output_flush_ns + self.outputFlushIntervalNs();
-            const remaining_ns = flush_due - now;
-            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
-            timeout = @min(timeout, remaining_ms);
-        }
-
-        if (self.reliable_send.hasPending()) {
-            const rto_ms = @divFloor(self.peer.rto_us(), 1000);
-            timeout = @min(timeout, @max(@as(i64, 1), rto_ms));
-        }
-
-        if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
-
-        return @intCast(@max(@as(i64, 0), timeout));
-    }
-
-    fn outputFlushIntervalNs(self: *const Gateway) i64 {
-        const srtt_us = self.peer.srtt_us orelse 32_000;
-        const paced_us = std.math.clamp(@divFloor(srtt_us, 8), @as(i64, 2_000), @as(i64, 8_000));
-        return paced_us * std.time.ns_per_us;
-    }
-
-    fn sendHeartbeat(self: *Gateway, now: i64) !void {
-        var pkt_buf: [1200]u8 = undefined;
-        const pkt = try transport.buildUnreliable(
-            .heartbeat,
-            0,
-            self.reliable_recv.ack(),
-            self.reliable_recv.ackBits(),
-            "",
-            &pkt_buf,
-        );
-        try self.peer.send(&self.udp_sock, pkt);
-        self.last_ack_send_ns = now;
-        self.ack_dirty = false;
-    }
-
-    fn flushRetransmits(self: *Gateway, now: i64) !void {
-        var packets = try self.reliable_send.collectRetransmits(self.alloc, now, self.peer.rto_us());
-        defer packets.deinit(self.alloc);
-
-        for (packets.items) |packet| {
-            self.peer.send(&self.udp_sock, packet) catch |err| {
-                if (err == error.NoPeerAddress or err == error.WouldBlock) continue;
-                return err;
-            };
-        }
-    }
-
-    fn flushOutput(self: *Gateway, now: i64, force: bool) !void {
-        if (self.output_coalesce_buf.items.len == 0) return;
-        if (!force and (now - self.last_output_flush_ns) < self.outputFlushIntervalNs()) return;
-
-        if (self.peer.addr == null) {
-            self.output_coalesce_buf.clearRetainingCapacity();
-            self.last_output_flush_ns = now;
-            return;
-        }
-
-        var sent_off: usize = 0;
-        while (sent_off < self.output_coalesce_buf.items.len) {
-            const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
-            const chunk = self.output_coalesce_buf.items[sent_off..end];
-
-            var pkt_buf: [1200]u8 = undefined;
-            const seq = self.output_seq;
-            self.output_seq +%= 1;
-            const pkt = try transport.buildUnreliable(
-                .output,
-                seq,
-                self.reliable_recv.ack(),
-                self.reliable_recv.ackBits(),
-                chunk,
-                &pkt_buf,
-            );
-
-            self.peer.send(&self.udp_sock, pkt) catch |err| {
-                if (err == error.WouldBlock) {
-                    log.debug("udp output send would block; dropping stale output and requesting resync", .{});
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    try self.requestSnapshot(now);
-                    self.last_output_flush_ns = now;
-                    return;
-                }
-                if (err == error.NoPeerAddress) {
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    self.last_output_flush_ns = now;
-                    return;
-                }
-                return err;
-            };
-
-            sent_off = end;
-        }
-
-        if (sent_off > 0) {
-            self.output_coalesce_buf.replaceRange(self.alloc, 0, sent_off, &[_]u8{}) catch unreachable;
-        }
-
-        self.last_output_flush_ns = now;
-    }
-
-    fn trackClientResize(self: *Gateway, payload: []const u8) void {
-        var offset: usize = 0;
-        while (offset < payload.len) {
-            const remaining = payload[offset..];
-            const msg_len = ipc.expectedLength(remaining) orelse break;
-            if (remaining.len < msg_len) break;
-
-            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-            const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len == @sizeOf(ipc.Resize)) {
-                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload);
-                self.have_client_size = true;
-            }
-
-            offset += msg_len;
-        }
-    }
-
-    fn appendUnixWrite(self: *Gateway, payload: []const u8) !void {
-        if (self.unix_write_buf.items.len + payload.len > max_unix_write_buf) {
-            return error.UnixWriteBackpressure;
-        }
-        try self.unix_write_buf.appendSlice(self.alloc, payload);
-    }
-
-    fn requestSnapshot(self: *Gateway, now: i64) !void {
-        if ((now - self.last_resync_request_ns) < resync_cooldown_ns) return;
-        self.last_resync_request_ns = now;
-
-        const size = if (self.have_client_size) self.last_resize else ipc.Resize{ .rows = 24, .cols = 80 };
-        var init_buf: [64]u8 = undefined;
-        const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-        try self.appendUnixWrite(init_ipc);
-        log.debug("requested terminal snapshot rows={d} cols={d}", .{ size.rows, size.cols });
-    }
-
-    fn handleTransportPacket(self: *Gateway, plaintext: []const u8, now: i64) !void {
-        const packet = transport.parsePacket(plaintext) catch |err| {
-            log.debug("transport parse failed: {s}", .{@errorName(err)});
-            return;
-        };
-
-        self.reliable_send.ack(packet.ack, packet.ack_bits);
-
-        switch (packet.channel) {
-            .heartbeat => {},
-            .output => {
-                // Client never sends output channel packets.
-            },
-            .reliable_ipc, .control => {
-                self.ack_dirty = true;
-                const action = self.reliable_recv.onReliable(packet.seq);
-                if (action != .accept) return;
-
-                if (packet.channel == .reliable_ipc) {
-                    self.trackClientResize(packet.payload);
-                    self.appendUnixWrite(packet.payload) catch |err| {
-                        log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
-                        self.running = false;
-                        return;
-                    };
-                } else {
-                    const ctrl = transport.parseControl(packet.payload) catch return;
-                    if (ctrl == .resync_request) {
-                        self.requestSnapshot(now) catch |err| {
-                            log.warn("failed to queue snapshot request: {s}", .{@errorName(err)});
-                            self.running = false;
-                        };
-                    }
-                }
-            },
-        }
-    }
-
-    fn sendReliablePayload(self: *Gateway, channel: transport.Channel, payload: []const u8, now: i64) !void {
-        const packet = try self.reliable_send.buildAndTrack(
-            channel,
-            payload,
-            self.reliable_recv.ack(),
-            self.reliable_recv.ackBits(),
-            now,
-        );
-        self.peer.send(&self.udp_sock, packet) catch |err| {
-            if (err == error.NoPeerAddress or err == error.WouldBlock) return;
-            return err;
-        };
-    }
-
-    fn sendIpcReliable(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
-        if (payload.len <= max_ipc_payload) {
-            var buf: [transport.max_payload_len]u8 = undefined;
-            const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
-            try self.sendReliablePayload(.reliable_ipc, ipc_bytes, now);
-            return;
-        }
-
-        var off: usize = 0;
-        while (off < payload.len) {
-            const end = @min(off + max_ipc_payload, payload.len);
-            var buf: [transport.max_payload_len]u8 = undefined;
-            const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
-            try self.sendReliablePayload(.reliable_ipc, ipc_bytes, now);
-            off = end;
-        }
-    }
-
-    fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
-        if (tag == .Output) {
-            if (self.output_coalesce_buf.items.len + payload.len > max_output_coalesce) {
-                log.debug("output coalesce buffer overflow; dropping stale output and requesting snapshot", .{});
-                self.output_coalesce_buf.clearRetainingCapacity();
-                try self.requestSnapshot(now);
+    fn receiveRemote(self: *Gateway, now: i64) !void {
+        if (self.phase == .priming) return;
+        if (self.detached or self.eof) return;
+        while (self.link.recv.peek()) |bytes| {
+            const msg = try wire.decode(bytes);
+            if (self.phase == .awaiting_init) {
+                if (msg.tag != .Init) return error.InitialSizeRequired;
+                // Core skips restoration on its first ever Init. Prime that
+                // existing state on a provisional connection, then wait for
+                // Detach's EOF processing barrier before reconnecting. Drop
+                // all provisional output so an existing session restores once.
+                if (!try self.appendRemote(msg)) break;
+                var detach: std.ArrayList(u8) = .empty;
+                defer detach.deinit(self.alloc);
+                try zmx.ipc.appendMessage(self.alloc, &detach, .Detach, "");
+                try self.native.append(self.alloc, detach.items);
+                self.phase = .priming;
+                self.prime_started = now;
+                self.link.recv.pop();
                 return;
             }
-            try self.output_coalesce_buf.appendSlice(self.alloc, payload);
-            if (self.output_coalesce_buf.items.len >= transport.max_payload_len * 4) {
-                try self.flushOutput(now, true);
+            if (!try self.appendRemote(msg)) break;
+            self.link.recv.pop();
+            if (self.detached) break;
+        }
+        if (self.resize_requested) {
+            if (self.size) |size| {
+                const bytes = wire.encodeSize(size);
+                if (try self.appendRemote(.{ .tag = .Resize, .data = &bytes })) self.resize_requested = false;
+            }
+        }
+    }
+
+    fn forwardFrame(self: *Gateway) !void {
+        if (self.phase != .streaming) return;
+        const msg = (try self.frame.message()) orelse return;
+        switch (msg.header.tag) {
+            .Output => {
+                // Keep a maximum-sized native snapshot in this single frame;
+                // copy only chunks that fit the separately bounded send queue.
+                while (self.output_cursor < msg.payload.len) {
+                    const n = @min(link_mod.chunk_size, msg.payload.len - self.output_cursor);
+                    if (self.link.outgoing.room() < wire.header_len + n) return;
+                    try self.link.enqueue(.Output, msg.payload[self.output_cursor..][0..n]);
+                    self.output_cursor += n;
+                }
+            },
+            .Resize => {
+                if (msg.payload.len != 0) return error.InvalidNativeResize;
+                self.resize_requested = true;
+            },
+            .Switch => return error.UnsupportedSessionSwitch,
+            // Informational records do not imply session termination and are
+            // deliberately excluded from the remote terminal vocabulary.
+            else => {},
+        }
+        self.frame.clear();
+        self.output_cursor = 0;
+    }
+
+    fn readPaused(self: *Gateway, now: i64) !bool {
+        const queued = self.link.outgoing.data().len;
+        if (self.paused_since == null and queued >= pause_high) self.paused_since = now;
+        if (self.paused_since) |start| {
+            if (queued < pause_low) {
+                self.paused_since = null;
+            } else {
+                if (now - start >= pause_timeout) return error.NativeReadPauseTimeout;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn readNative(self: *Gateway, fd: i32) !void {
+        if (self.phase == .priming) {
+            // The provisional stream is discarded, including a truncated
+            // snapshot when Detach closes the core client with queued bytes.
+            for (0..64) |_| {
+                var discard: [16 * 1024]u8 = undefined;
+                const n = p.read(fd, &discard) catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    else => return err,
+                };
+                if (n == 0) {
+                    self.eof = true;
+                    return;
+                }
             }
             return;
         }
-
-        try self.flushOutput(now, true);
-        try self.sendIpcReliable(tag, payload, now);
+        // Reading exactly one frame's remainder ensures a cap-sized snapshot
+        // cannot acquire another frame's bytes behind it.
+        for (0..64) |_| {
+            try self.forwardFrame();
+            const remaining = try self.frame.remaining();
+            if (remaining == 0) return;
+            var buf: [16 * 1024]u8 = undefined;
+            const n = p.read(fd, buf[0..@min(buf.len, remaining)]) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+            if (n == 0) {
+                if (self.frame.bytes.items.len != 0) return error.TruncatedNativeFrame;
+                self.eof = true;
+                return;
+            }
+            try self.frame.append(self.alloc, buf[0..n]);
+            if (self.link.outgoing.data().len >= pause_high) return;
+        }
     }
 
-    pub fn deinit(self: *Gateway) void {
-        posix.close(self.unix_fd);
-        self.udp_sock.close();
-        self.unix_read_buf.deinit();
-        self.unix_write_buf.deinit(self.alloc);
-        self.output_coalesce_buf.deinit(self.alloc);
-        self.reliable_send.deinit();
+    fn finishPriming(self: *Gateway, io: std.Io, fd: *i32, now: i64) !void {
+        std.debug.assert(self.phase == .priming and self.eof);
+        if (self.native.data().len != 0) return error.InitializationClosedEarly;
+        p.close(fd.*);
+        fd.* = -1;
+        const replacement = try zmx.connect(self.alloc, io, self.session);
+        errdefer p.close(replacement);
+        _ = try runtime.nonblocking(replacement);
+        const bytes = wire.encodeSize(self.size orelse return error.InitialSizeRequired);
+        if (!try self.appendRemote(.{ .tag = .Init, .data = &bytes })) return error.QueueFull;
+        fd.* = replacement;
+        self.phase = .streaming;
+        self.eof = false;
+        self.resize_requested = false;
+        self.native_progress = now;
+    }
+
+    fn writeNative(self: *Gateway, fd: i32, now: i64) !void {
+        if (self.native.data().len == 0) {
+            self.native_progress = now;
+            return;
+        }
+        const n = p.write(fd, self.native.data()) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) {
+            self.native.consume(n);
+            self.native_progress = now;
+        } else if (now - self.native_progress >= link_mod.progress_timeout_ns) return error.NativeWriteTimeout;
     }
 };
 
-/// Entry point for `zmx serve <session>`.
-pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
-    var gw = try Gateway.init(alloc, session_name, .{});
-    defer gw.deinit();
-    try gw.run();
+pub fn run(alloc: std.mem.Allocator, io: std.Io, raw_session: []const u8) !void {
+    // A bootstrap without authenticated UDP must not leave an unread client
+    // attached to the core's output broadcast queue.
+    var native_fd: i32 = -1;
+    defer if (native_fd >= 0) p.close(native_fd);
+    const key = try crypto.generateKey(io);
+    var socket = try udp.UdpSocket.bind(60000, 61000);
+    var link = link_mod.Link.init(alloc, socket, key, .to_client, udp.nanoNow(io)) catch |err| {
+        socket.close();
+        return err;
+    };
+    defer link.deinit();
+    try runtime.init();
+    defer runtime.deinit();
+    var bootstrap: [128]u8 = undefined;
+    const encoded_key = crypto.keyToBase64(key);
+    const record = try std.fmt.bufPrint(&bootstrap, "ZMX_CONNECT udp {d} {s}\n", .{ socket.bound_port, encoded_key });
+    var written: usize = 0;
+    while (written < record.len) written += try p.write(1, record[written..]);
+    p.close(1); // Dedicated bootstrap pipe; no SSH descriptor survives this point.
+    var gateway = Gateway{ .alloc = alloc, .link = &link, .native_progress = udp.nanoNow(io), .session = raw_session };
+    defer gateway.deinit();
+    gatewayLoop(&gateway, io, &native_fd) catch |err| {
+        // Disconnect before the bounded failure notification: retaining a
+        // stopped native reader would allow the daemon's backlog to grow.
+        if (native_fd >= 0) {
+            p.close(native_fd);
+            native_fd = -1;
+        }
+        // An existing terminal drain owns its original deadline. Starting a
+        // second error drain would keep the peer alive beyond that bound.
+        if (!gateway.ended) notifyFailure(&link, io, @errorName(err));
+        return err;
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-test "bootstrap output format" {
-    const key = crypto.generateKey();
-    const encoded = crypto.keyToBase64(key);
-    const port: u16 = 60042;
-
-    var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "ZMX_CONNECT udp {d} {s}\n", .{ port, encoded });
-
-    // Verify it starts with the expected prefix
-    try std.testing.expect(std.mem.startsWith(u8, line, "ZMX_CONNECT udp "));
-
-    // Parse back
-    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, line, "\n"), ' ');
-    try std.testing.expectEqualStrings("ZMX_CONNECT", it.next().?);
-    try std.testing.expectEqualStrings("udp", it.next().?);
-    const port_str = it.next().?;
-    const parsed_port = try std.fmt.parseInt(u16, port_str, 10);
-    try std.testing.expect(parsed_port == 60042);
-    const key_str = it.next().?;
-    const decoded_key = try crypto.keyFromBase64(key_str);
-    try std.testing.expectEqual(key, decoded_key);
+fn gatewayLoop(g: *Gateway, io: std.Io, fd: *i32) !void {
+    while (true) {
+        const now = udp.nanoNow(io);
+        try g.link.receive(now);
+        if (g.phase == .priming) {
+            if (now - g.prime_started >= link_mod.progress_timeout_ns) return error.InitializationTimeout;
+            if (g.eof) try g.finishPriming(io, fd, now);
+        }
+        try g.receiveRemote(now);
+        if (g.phase == .priming and fd.* < 0) {
+            fd.* = try zmx.connect(g.alloc, io, g.session);
+            _ = try runtime.nonblocking(fd.*);
+            g.native_progress = now;
+        }
+        try g.forwardFrame();
+        const paused = try g.readPaused(now);
+        if (g.phase == .streaming and g.eof and !g.ended and g.frame.bytes.items.len == 0 and g.link.outgoing.room() >= wire.header_len) {
+            try g.link.enqueue(.SessionEnd, "");
+            g.ended = true;
+            g.end_started = now;
+        }
+        try g.link.tick(now);
+        if (g.ended and g.link.idle()) return;
+        if (g.end_started) |start| {
+            if (now - start >= link_mod.drain_timeout_ns) return error.TerminationDrainTimeout;
+        }
+        const can_read = g.phase != .awaiting_init and !g.eof and !paused and g.link.peer.addr != null and (try g.frame.remaining()) != 0;
+        var fds = [_]p.pollfd{
+            .{ .fd = g.link.socket.fd, .events = p.POLL.IN, .revents = 0 },
+            .{ .fd = if (g.eof or (!can_read and g.native.data().len == 0)) -1 else fd.*, .events = (if (can_read) @as(i16, p.POLL.IN) else 0) | (if (g.native.data().len > 0) @as(i16, p.POLL.OUT) else 0), .revents = 0 },
+            .{ .fd = runtime.sig_pipe[0], .events = p.POLL.IN, .revents = 0 },
+        };
+        _ = try p.poll(&fds, 20);
+        if (fds[2].revents != 0) runtime.drainSignalPipe();
+        if (runtime.stopped.load(.acquire)) return error.GatewayInterrupted;
+        // POLLHUP may accompany readable final data. Only read() == 0 ends
+        // the stream, and a partially received final frame is always failure.
+        if (can_read and fds[1].revents & (p.POLL.IN | p.POLL.HUP) != 0) try g.readNative(fd.*);
+        if (!g.eof) try g.writeNative(fd.*, udp.nanoNow(io));
+        if (fds[1].revents & (p.POLL.ERR | p.POLL.NVAL) != 0 and !g.eof) return error.NativeSocketFailure;
+    }
 }
 
-test "resolveSocketDir returns valid path" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+fn notifyFailure(link: *link_mod.Link, io: std.Io, reason: []const u8) void {
+    if (link.peer.addr == null) return;
+    const start = udp.nanoNow(io);
+    var queued = false;
+    while (udp.nanoNow(io) - start < link_mod.drain_timeout_ns) {
+        const now = udp.nanoNow(io);
+        link.receive(now) catch return;
+        if (!queued and link.outgoing.room() >= wire.header_len + reason.len) {
+            link.enqueue(.SessionEnd, reason) catch return;
+            queued = true;
+        }
+        link.tick(now) catch return;
+        if (queued and link.idle()) return;
+        var fds = [_]p.pollfd{.{ .fd = link.socket.fd, .events = p.POLL.IN, .revents = 0 }};
+        _ = p.poll(&fds, 20) catch return;
+    }
+}
 
-    const dir = try resolveSocketDir(alloc);
-    defer alloc.free(dir);
-    try std.testing.expect(dir.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, dir, "zmx") != null);
+test "gateway forwards cap-sized snapshot incrementally without dropping final bytes" {
+    const alloc = std.testing.allocator;
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(udp.Address.initIp4(.{ 127, 0, 0, 1 }, 60000)), .{0} ** crypto.key_length, .to_client, 0);
+    defer link.deinit();
+    var g = Gateway{ .alloc = alloc, .link = &link, .native_progress = 0, .phase = .streaming };
+    defer g.deinit();
+    const test_payload_len = 1024 * 1024;
+    const header = zmx.ipc.Header{ .tag = .Output, .len = test_payload_len };
+    try g.frame.append(alloc, std.mem.asBytes(&header));
+    const payload = try alloc.alloc(u8, test_payload_len);
+    defer alloc.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    try g.frame.append(alloc, payload);
+    try g.forwardFrame();
+    try std.testing.expect(g.output_cursor > 0 and g.output_cursor < payload.len);
+    try std.testing.expectEqual(payload.len + @sizeOf(zmx.ipc.Header), g.frame.bytes.items.len);
+    var received: usize = 0;
+    while (true) {
+        while (link.outgoing.data().len > 0) {
+            const data = link.outgoing.data();
+            const len = wire.header_len + @as(usize, std.mem.readInt(u32, data[1..5], .little));
+            const msg = try wire.decode(data[0..len]);
+            try std.testing.expectEqual(wire.Tag.Output, msg.tag);
+            try std.testing.expectEqualSlices(u8, payload[received..][0..msg.data.len], msg.data);
+            received += msg.data.len;
+            link.outgoing.consume(len);
+        }
+        if (g.frame.bytes.items.len == 0) break;
+        try g.forwardFrame();
+    }
+    try std.testing.expectEqual(payload.len, received);
+}
+
+test "gateway bounded native admission and deferred size handoff" {
+    const alloc = std.testing.allocator;
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(udp.Address.initIp4(.{ 127, 0, 0, 1 }, 60000)), .{0} ** crypto.key_length, .to_client, 0);
+    defer link.deinit();
+    var g = Gateway{ .alloc = alloc, .link = &link, .native_progress = 0, .phase = .streaming };
+    defer g.deinit();
+    const header = zmx.ipc.Header{ .tag = .Resize, .len = 0 };
+    try g.frame.append(alloc, std.mem.asBytes(&header));
+    try g.forwardFrame();
+    try g.receiveRemote(0);
+    try std.testing.expect(g.resize_requested);
+    try std.testing.expectEqual(@as(usize, 0), g.native.data().len);
+    const size = wire.encodeSize(.{ .rows = 31, .cols = 97 });
+    try std.testing.expect(try g.appendRemote(.{ .tag = .Init, .data = &size }));
+    try g.receiveRemote(0);
+    try std.testing.expect(!g.resize_requested);
+    const first_len = 16;
+    const resize = std.mem.bytesToValue(zmx.ipc.Header, g.native.data()[first_len..][0..8]);
+    try std.testing.expectEqual(zmx.ipc.Tag.Resize, resize.tag);
+    const room = g.native.room();
+    const filler = try alloc.alloc(u8, room);
+    defer alloc.free(filler);
+    @memset(filler, 0);
+    try g.native.append(alloc, filler);
+    try std.testing.expect(!try g.appendRemote(.{ .tag = .Input, .data = "retained remotely" }));
+    try std.testing.expectEqual(@as(usize, link_mod.limit), g.native.data().len);
+}
+
+test "gateway read pause uses hysteresis and a fixed two second deadline" {
+    const alloc = std.testing.allocator;
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(udp.Address.initIp4(.{ 127, 0, 0, 1 }, 60000)), .{0} ** crypto.key_length, .to_client, 0);
+    defer link.deinit();
+    var g = Gateway{ .alloc = alloc, .link = &link, .native_progress = 0, .phase = .streaming };
+    defer g.deinit();
+    const payload = try alloc.alloc(u8, pause_high);
+    defer alloc.free(payload);
+    @memset(payload, 0);
+    try link.outgoing.append(alloc, payload);
+    try std.testing.expect(try g.readPaused(100));
+    try std.testing.expect(try g.readPaused(100 + pause_timeout - 1));
+    try std.testing.expectError(error.NativeReadPauseTimeout, g.readPaused(100 + pause_timeout));
+    link.outgoing.consume(pause_high - pause_low + 1);
+    try std.testing.expect(!try g.readPaused(100 + pause_timeout));
+}
+
+test "gateway drains final readable frame before EOF and rejects partial final frame" {
+    const alloc = std.testing.allocator;
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(udp.Address.initIp4(.{ 127, 0, 0, 1 }, 60000)), .{0} ** crypto.key_length, .to_client, 0);
+    defer link.deinit();
+    for ([_]bool{ false, true }) |partial| {
+        var g = Gateway{ .alloc = alloc, .link = &link, .native_progress = 0, .phase = .streaming };
+        defer g.deinit();
+        const pipe = try p.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+        defer p.close(pipe[0]);
+        const header = zmx.ipc.Header{ .tag = .Output, .len = 5 };
+        _ = try p.write(pipe[1], std.mem.asBytes(&header));
+        _ = try p.write(pipe[1], "final");
+        if (partial) _ = try p.write(pipe[1], std.mem.asBytes(&header)[0..3]);
+        p.close(pipe[1]);
+        if (partial) {
+            try std.testing.expectError(error.TruncatedNativeFrame, g.readNative(pipe[0]));
+            try std.testing.expect(!g.eof);
+        } else {
+            try g.readNative(pipe[0]);
+            try std.testing.expect(g.eof);
+        }
+        const msg = try wire.decode(link.outgoing.data());
+        try std.testing.expectEqual(wire.Tag.Output, msg.tag);
+        try std.testing.expectEqualStrings("final", msg.data);
+        link.outgoing.consume(link.outgoing.data().len);
+    }
+}
+
+test "gateway primes only first Init and retains later input behind processing barrier" {
+    const alloc = std.testing.allocator;
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(udp.Address.initIp4(.{ 127, 0, 0, 1 }, 60000)), .{0} ** crypto.key_length, .to_client, 0);
+    defer link.deinit();
+    var g = Gateway{ .alloc = alloc, .link = &link, .native_progress = 0 };
+    defer g.deinit();
+    const size = wire.encodeSize(.{ .rows = 24, .cols = 80 });
+    var record: [128]u8 = undefined;
+    _ = try link.recv.accept(1, try wire.encode(.Init, &size, &record));
+    _ = try link.recv.accept(2, try wire.encode(.Input, "one command", &record));
+    try g.receiveRemote(100);
+    try std.testing.expectEqual(Gateway.Phase.priming, g.phase);
+    try std.testing.expectEqual(@as(i64, 100), g.prime_started);
+    try std.testing.expectEqual(wire.Tag.Input, (try wire.decode(link.recv.peek().?)).tag);
+    try std.testing.expectEqual(@as(usize, 24), g.native.data().len); // Init size and Detach.
+    const detach = std.mem.bytesToValue(zmx.ipc.Header, g.native.data()[16..24]);
+    try std.testing.expectEqual(zmx.ipc.Tag.Detach, detach.tag);
+    try g.receiveRemote(200);
+    try std.testing.expectEqual(@as(usize, 24), g.native.data().len);
+    try std.testing.expect(!g.detached);
+    // A truncated provisional snapshot is intentionally discarded, never
+    // acknowledged as terminal output or reported as successful termination.
+    const pipe = try p.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer p.close(pipe[0]);
+    _ = try p.write(pipe[1], "partial snapshot");
+    p.close(pipe[1]);
+    try g.readNative(pipe[0]);
+    try std.testing.expect(g.eof);
+    try std.testing.expectEqual(@as(usize, 0), link.outgoing.data().len);
+    try std.testing.expectEqual(@as(usize, 0), g.frame.bytes.items.len);
 }

@@ -1,19 +1,16 @@
+// Adapted from mmonad/zmosh, revision 71eba23416bfb443df755ad89d6d06e665ebcd95.
+// MIT license; see ../LICENSE and ../UPSTREAM.md.
 const std = @import("std");
-const ipc = @import("ipc.zig");
 
 pub const version: u8 = 1;
 pub const max_payload_len: usize = 1100;
-const header_len: usize = 20;
+pub const header_len: usize = 20;
 
 pub const Channel = enum(u8) {
     heartbeat = 0,
     reliable_ipc = 1,
     output = 2,
     control = 3,
-};
-
-pub const Control = enum(u8) {
-    resync_request = 1,
 };
 
 pub const Packet = struct {
@@ -28,13 +25,6 @@ pub const ReliableAction = enum {
     accept,
     duplicate,
     stale,
-};
-
-pub const OutputAction = enum {
-    accept,
-    duplicate,
-    stale,
-    gap,
 };
 
 pub const RecvState = struct {
@@ -52,10 +42,10 @@ pub const RecvState = struct {
 
         if (seq > self.latest) {
             const shift = seq - self.latest;
-            if (shift >= 32) {
+            if (shift > 32) {
                 self.mask = 0;
             } else {
-                self.mask <<= @intCast(shift);
+                self.mask = if (shift == 32) 0 else self.mask << @intCast(shift);
                 self.mask |= @as(u32, 1) << @intCast(shift - 1);
             }
             self.latest = seq;
@@ -81,35 +71,9 @@ pub const RecvState = struct {
     }
 };
 
-pub const OutputRecvState = struct {
-    latest: u32 = 0,
-    has_latest: bool = false,
-
-    pub fn onPacket(self: *OutputRecvState, seq: u32) OutputAction {
-        if (!self.has_latest) {
-            self.latest = seq;
-            self.has_latest = true;
-            return .accept;
-        }
-
-        if (seq == self.latest + 1) {
-            self.latest = seq;
-            return .accept;
-        }
-
-        if (seq <= self.latest) {
-            return .duplicate;
-        }
-
-        // seq jumped ahead.
-        self.latest = seq;
-        return .gap;
-    }
-};
-
 pub const ReliableSend = struct {
     alloc: std.mem.Allocator,
-    next_seq: u32 = 1,
+    next_seq: u64 = 1,
     pending: std.ArrayList(Pending),
 
     const Pending = struct {
@@ -133,6 +97,16 @@ pub const ReliableSend = struct {
         self.pending.deinit(self.alloc);
     }
 
+    pub fn oldestSeq(self: *const ReliableSend) ?u32 {
+        return if (self.pending.items.len == 0) null else self.pending.items[0].seq;
+    }
+
+    pub fn canSend(self: *const ReliableSend) bool {
+        if (self.next_seq > std.math.maxInt(u32)) return false;
+        if (self.oldestSeq()) |oldest| return self.next_seq - oldest < 32;
+        return true;
+    }
+
     pub fn hasPending(self: *const ReliableSend) bool {
         return self.pending.items.len > 0;
     }
@@ -145,10 +119,14 @@ pub const ReliableSend = struct {
         ack_bits: u32,
         now_ns: i64,
     ) ![]const u8 {
-        const seq = self.next_seq;
-        self.next_seq +%= 1;
+        if (self.next_seq > std.math.maxInt(u32)) return error.SequenceExhausted;
+        if (!self.canSend()) return error.WindowFull;
+        if (channel != .reliable_ipc) return error.InvalidChannel;
+        if (payload.len > max_payload_len) return error.PayloadTooLarge;
+        const seq: u32 = @intCast(self.next_seq);
 
         const packet = try self.alloc.alloc(u8, header_len + payload.len);
+        errdefer self.alloc.free(packet);
         writeHeader(packet[0..header_len], channel, seq, ack_seq, ack_bits, payload.len);
         if (payload.len > 0) {
             @memcpy(packet[header_len..], payload);
@@ -161,6 +139,7 @@ pub const ReliableSend = struct {
             .packet = packet,
         });
 
+        self.next_seq += 1;
         return packet;
     }
 
@@ -171,7 +150,7 @@ pub const ReliableSend = struct {
             const p = self.pending.items[i];
             if (isAcked(p.seq, ack_seq, ack_bits)) {
                 self.alloc.free(p.packet);
-                _ = self.pending.swapRemove(i);
+                _ = self.pending.orderedRemove(i);
             }
         }
     }
@@ -182,7 +161,8 @@ pub const ReliableSend = struct {
         now_ns: i64,
         rto_us: i64,
     ) !std.ArrayList([]const u8) {
-        var out = try std.ArrayList([]const u8).initCapacity(alloc, 4);
+        var out = try std.ArrayList([]const u8).initCapacity(alloc, 32);
+        errdefer out.deinit(alloc);
         const interval_ns = @max(@as(i64, 1), rto_us) * std.time.ns_per_us;
 
         for (self.pending.items) |*p| {
@@ -231,13 +211,14 @@ pub fn parsePacket(data: []const u8) !Packet {
     if (data[0] != version) return error.UnsupportedVersion;
 
     const channel_int = data[1];
-    const channel = std.meta.intToEnum(Channel, channel_int) catch return error.InvalidChannel;
+    const channel = std.enums.fromInt(Channel, channel_int) orelse return error.InvalidChannel;
 
     const seq = std.mem.readInt(u32, data[4..8], .big);
     const ack = std.mem.readInt(u32, data[8..12], .big);
     const ack_bits = std.mem.readInt(u32, data[12..16], .big);
     const len = std.mem.readInt(u16, data[16..18], .big);
 
+    if (len > max_payload_len) return error.PayloadTooLarge;
     if (data.len != header_len + len) return error.InvalidLength;
 
     return .{
@@ -257,6 +238,7 @@ pub fn buildUnreliable(
     payload: []const u8,
     out: []u8,
 ) ![]const u8 {
+    if (payload.len > max_payload_len) return error.PayloadTooLarge;
     const total = header_len + payload.len;
     if (out.len < total) return error.BufferTooSmall;
     writeHeader(out[0..header_len], channel, seq, ack, ack_bits, payload.len);
@@ -264,29 +246,6 @@ pub fn buildUnreliable(
         @memcpy(out[header_len..total], payload);
     }
     return out[0..total];
-}
-
-pub fn buildControl(control: Control, out: *[8]u8) []const u8 {
-    out[0] = @intFromEnum(control);
-    @memset(out[1..], 0);
-    return out[0..1];
-}
-
-pub fn parseControl(payload: []const u8) !Control {
-    if (payload.len < 1) return error.InvalidControl;
-    return std.meta.intToEnum(Control, payload[0]) catch error.InvalidControl;
-}
-
-pub fn buildIpcBytes(tag: ipc.Tag, payload: []const u8, buf: []u8) []const u8 {
-    const header = ipc.Header{ .tag = tag, .len = @intCast(payload.len) };
-    const hdr_bytes = std.mem.asBytes(&header);
-    const total = @sizeOf(ipc.Header) + payload.len;
-    std.debug.assert(buf.len >= total);
-    @memcpy(buf[0..@sizeOf(ipc.Header)], hdr_bytes);
-    if (payload.len > 0) {
-        @memcpy(buf[@sizeOf(ipc.Header)..total], payload);
-    }
-    return buf[0..total];
 }
 
 test "transport header round trip" {
@@ -310,9 +269,124 @@ test "reliable recv window" {
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
 }
 
-test "output gap detection" {
-    var out = OutputRecvState{};
-    try std.testing.expect(out.onPacket(1) == .accept);
-    try std.testing.expect(out.onPacket(3) == .gap);
-    try std.testing.expect(out.onPacket(2) == .duplicate);
+test "send window remains anchored to missing oldest across gaps 31 32 33" {
+    var sender = try ReliableSend.init(std.testing.allocator);
+    defer sender.deinit();
+    for (0..32) |_| _ = try sender.buildAndTrack(.reliable_ipc, "x", 0, 0, 0);
+    sender.ack(32, 0x3fffffff); // Admit 2..32, but keep 1 outstanding.
+    try std.testing.expectEqual(@as(?u32, 1), sender.oldestSeq());
+    try std.testing.expectError(error.WindowFull, sender.buildAndTrack(.reliable_ipc, "x", 0, 0, 0));
+    sender.ack(33, 0); // An impossible future ACK must not free sequence 1.
+    try std.testing.expect(!sender.canSend());
+    sender.ack(32, 0x40000000); // Gap 31 acknowledges 1.
+    try std.testing.expect(sender.canSend());
+    try std.testing.expect(ReliableSend.isAcked(1, 33, 0x80000000));
+    try std.testing.expect(!ReliableSend.isAcked(1, 34, 0xffffffff));
+}
+
+test "ordered receiver retains reordering and refuses gaps 32 and 33" {
+    var receiver = OrderedRecv{};
+    try std.testing.expectEqual(.accept, try receiver.accept(32, "last"));
+    try std.testing.expectEqual(.stale, try receiver.accept(33, "outside"));
+    try std.testing.expectEqual(.stale, try receiver.accept(34, "outside"));
+    try std.testing.expectEqual(@as(u32, 32), receiver.ack());
+    try std.testing.expect(receiver.peek() == null);
+    try std.testing.expectEqual(.accept, try receiver.accept(2, "two"));
+    try std.testing.expect(receiver.peek() == null);
+    try std.testing.expectEqual(.accept, try receiver.accept(1, "one"));
+    try std.testing.expectEqualStrings("one", receiver.peek().?);
+    try std.testing.expectEqual(.duplicate, try receiver.accept(1, "duplicate"));
+    receiver.pop();
+    try std.testing.expectEqualStrings("two", receiver.peek().?);
+    receiver.pop();
+    try std.testing.expect(receiver.peek() == null);
+}
+
+test "reliable sequence exhaustion cannot wrap" {
+    var sender = try ReliableSend.init(std.testing.allocator);
+    defer sender.deinit();
+    sender.next_seq = std.math.maxInt(u32);
+    _ = try sender.buildAndTrack(.reliable_ipc, "last", 0, 0, 0);
+    try std.testing.expectError(error.SequenceExhausted, sender.buildAndTrack(.reliable_ipc, "wrap", 0, 0, 0));
+}
+
+test "ACK mask preserves previous latest at distance 32" {
+    var recv = RecvState{};
+    _ = recv.onReliable(1);
+    _ = recv.onReliable(33);
+    try std.testing.expectEqual(@as(u32, 0x80000000), recv.ackBits());
+}
+
+/// Receipt ACKs represent retained capacity. The caller pops only after the
+/// downstream sink has accepted the whole payload. No allocation on receive.
+pub const OrderedRecv = struct {
+    const Slot = struct {
+        seq: u32 = 0,
+        len: usize = 0,
+        bytes: [max_payload_len]u8 = undefined,
+    };
+    slots: [32]Slot = .{Slot{}} ** 32,
+    next_seq: u64 = 1,
+    received: RecvState = .{},
+
+    pub fn accept(self: *OrderedRecv, seq: u32, payload: []const u8) !ReliableAction {
+        if (seq == 0) return error.InvalidSequence;
+        if (payload.len > max_payload_len) return error.PayloadTooLarge;
+        if (seq < self.next_seq) return .duplicate;
+        if (@as(u64, seq) - self.next_seq >= self.slots.len) return .stale;
+        const slot = &self.slots[seq % self.slots.len];
+        if (slot.seq == seq) return .duplicate;
+        std.debug.assert(slot.seq == 0);
+        @memcpy(slot.bytes[0..payload.len], payload);
+        slot.len = payload.len;
+        slot.seq = seq;
+        _ = self.received.onReliable(seq);
+        return .accept;
+    }
+
+    pub fn peek(self: *const OrderedRecv) ?[]const u8 {
+        if (self.next_seq > std.math.maxInt(u32)) return null;
+        const slot = &self.slots[self.next_seq % self.slots.len];
+        return if (slot.seq == self.next_seq) slot.bytes[0..slot.len] else null;
+    }
+
+    pub fn pop(self: *OrderedRecv) void {
+        std.debug.assert(self.peek() != null);
+        self.slots[self.next_seq % self.slots.len].seq = 0;
+        self.next_seq += 1;
+    }
+
+    pub fn ack(self: *const OrderedRecv) u32 {
+        return self.received.ack();
+    }
+    pub fn ackBits(self: *const OrderedRecv) u32 {
+        return self.received.ackBits();
+    }
+};
+
+test "full receive window retains every packet until explicit drain" {
+    var receiver = OrderedRecv{};
+    var seq: u32 = 32;
+    while (seq > 0) : (seq -= 1) {
+        const payload = [_]u8{@intCast(seq)};
+        try std.testing.expectEqual(.accept, try receiver.accept(seq, &payload));
+    }
+    try std.testing.expectEqual(@as(u32, 0x7fffffff), receiver.ackBits());
+    try std.testing.expectEqual(.stale, try receiver.accept(33, "outside"));
+    for (1..33) |expected| {
+        try std.testing.expectEqual(@as(u8, @intCast(expected)), receiver.peek().?[0]);
+        receiver.pop();
+    }
+    try std.testing.expect(receiver.peek() == null);
+    try std.testing.expectEqual(.accept, try receiver.accept(33, "resumed"));
+    try std.testing.expectEqualStrings("resumed", receiver.peek().?);
+    try std.testing.expectError(error.InvalidSequence, receiver.accept(0, "zero"));
+}
+
+test "oversize receive is never acknowledged" {
+    var receiver = OrderedRecv{};
+    const oversized = [_]u8{0} ** (max_payload_len + 1);
+    try std.testing.expectError(error.PayloadTooLarge, receiver.accept(1, &oversized));
+    try std.testing.expectEqual(@as(u32, 0), receiver.ack());
+    try std.testing.expect(receiver.peek() == null);
 }

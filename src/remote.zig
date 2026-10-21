@@ -1,504 +1,370 @@
+// Adapted from mmonad/zmosh, revision 71eba23416bfb443df755ad89d6d06e665ebcd95.
+// MIT license; see ../LICENSE and ../UPSTREAM.md.
 const std = @import("std");
-const posix = std.posix;
-const crypto = @import("crypto.zig");
-const udp_mod = @import("udp.zig");
-const ipc = @import("ipc.zig");
-const transport = @import("transport.zig");
-const builtin = @import("builtin");
+const zmx = @import("libzmx");
+const p = @import("posix.zig");
+const c = @import("compat.zig").c;
+const bootstrap = @import("bootstrap.zig");
+const udp = @import("udp.zig");
+const link_mod = @import("link.zig");
+const wire = @import("wire.zig");
+const runtime = @import("runtime.zig");
 
-const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
-const max_stdout_buf = 4 * 1024 * 1024;
-const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
-
-const c = switch (builtin.os.tag) {
-    .macos => @cImport({
-        @cInclude("sys/ioctl.h");
-        @cInclude("termios.h");
-        @cInclude("unistd.h");
-    }),
-    .freebsd => @cImport({
-        @cInclude("termios.h");
-        @cInclude("unistd.h");
-    }),
-    else => @cImport({
-        @cInclude("sys/ioctl.h");
-        @cInclude("termios.h");
-        @cInclude("unistd.h");
-    }),
-};
-
-const log = std.log.scoped(.remote);
-
-pub const RemoteSession = struct {
-    host: []const u8,
-    port: u16,
-    key: crypto.Key,
-};
-
-/// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
-pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key } {
-    const trimmed = std.mem.trimRight(u8, line, "\r\n");
-    var it = std.mem.splitScalar(u8, trimmed, ' ');
-
-    const prefix = it.next() orelse return error.InvalidConnectLine;
-    if (!std.mem.eql(u8, prefix, "ZMX_CONNECT")) return error.InvalidConnectLine;
-
-    const proto = it.next() orelse return error.InvalidConnectLine;
-    if (!std.mem.eql(u8, proto, "udp")) return error.UnsupportedProtocol;
-
-    const port_str = it.next() orelse return error.InvalidConnectLine;
-    const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
-
-    const key_str = it.next() orelse return error.InvalidConnectLine;
-    const key = crypto.keyFromBase64(key_str) catch return error.InvalidKey;
-
-    return .{ .port = port, .key = key };
-}
-
-/// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
-/// Prepends common user bin dirs to PATH since SSH non-interactive sessions
-/// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
-    const term = posix.getenv("TERM") orelse "xterm-256color";
-    const colorterm = posix.getenv("COLORTERM");
-    const remote_cmd = if (colorterm) |ct|
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, ct, session },
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term, session },
-        );
-    defer alloc.free(remote_cmd);
-    const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-
-    // Read stdout looking for ZMX_CONNECT line
-    const stdout = child.stdout.?;
-    var buf: [512]u8 = undefined;
-    var total: usize = 0;
-
-    while (total < buf.len) {
-        const n = stdout.read(buf[total..]) catch |err| {
-            log.err("failed to read SSH stdout: {s}", .{@errorName(err)});
-            return error.SshReadFailed;
-        };
-        if (n == 0) break;
-        total += n;
-
-        // Check if we have a complete line
-        if (std.mem.indexOf(u8, buf[0..total], "\n")) |_| break;
+pub fn run(alloc: std.mem.Allocator, io: std.Io, session: bootstrap.RemoteSession) !void {
+    var failure: RemoteFailure = .{};
+    // Report after terminal cleanup so its reset cannot erase the diagnostic.
+    defer if (failure.len > 0) failure.report(2);
+    if (p.getenv("ZMOSH_DEBUG") != null) {
+        var msg_buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&msg_buf, "zmosh: connecting via UDP to {s}:{d} ...\n", .{ session.host, session.port })) |m| _ = p.write(2, m) catch 0 else |_| {}
     }
+    const address = try udp.Address.resolve(session.host, session.port);
+    var link = try link_mod.Link.init(alloc, try udp.UdpSocket.bindClient(address), session.key, .to_server, udp.nanoNow(io));
+    defer link.deinit();
+    link.peer.addr = address;
+    try runtime.init();
+    defer runtime.deinit();
 
-    if (total == 0) {
-        _ = child.wait() catch {};
-        return error.SshNoOutput;
+    const stdin_flags = try runtime.nonblocking(0);
+    defer _ = p.fcntl(0, p.F.SETFL, stdin_flags) catch 0;
+    const stdout_flags = try runtime.nonblocking(1);
+    defer _ = p.fcntl(1, p.F.SETFL, stdout_flags) catch 0;
+    var original: c.termios = undefined;
+    const tty = c.tcgetattr(0, &original) == 0;
+    if (tty) {
+        var raw = original;
+        c.cfmakeraw(&raw);
+        if (c.tcsetattr(0, c.TCSANOW, &raw) != 0) return error.TerminalSetupFailed;
     }
-
-    const result = parseConnectLine(buf[0..total]) catch |err| {
-        log.err("failed to parse connect line: {s}", .{@errorName(err)});
-        _ = child.wait() catch {};
-        return error.InvalidConnectLine;
+    defer if (tty) {
+        _ = c.tcsetattr(0, c.TCSAFLUSH, &original);
+        // Match local zmx's cleanup of terminal modes after detach/error.
+        _ = p.write(1, "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\") catch 0;
     };
-
-    // Close our end of the pipes — we have the connect info.
-    // Don't wait for SSH to exit: the remote gateway runs indefinitely.
-    // SSH will be killed when we exit or will linger harmlessly.
-    if (child.stdin) |f| {
-        f.close();
-        child.stdin = null;
-    }
-    if (child.stdout) |f| {
-        f.close();
-        child.stdout = null;
-    }
-
-    return .{
-        .host = host,
-        .port = result.port,
-        .key = result.key,
-    };
-}
-
-var sigwinch_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-fn handleSigwinch(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    sigwinch_received.store(true, .release);
-}
-
-fn setupSigwinchHandler() void {
-    const act: posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSigwinch },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.SIGINFO,
-    };
-    posix.sigaction(posix.SIG.WINCH, &act, null);
-}
-
-fn getTerminalSize() ipc.Resize {
-    var ws: c.struct_winsize = undefined;
-    if (c.ioctl(posix.STDOUT_FILENO, c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
-    }
-    return .{ .rows = 24, .cols = 80 };
-}
-
-/// Detects Kitty keyboard protocol escape sequence for Ctrl+\
-fn isKittyCtrlBackslash(buf: []const u8) bool {
-    return std.mem.indexOf(u8, buf, "\x1b[92;5u") != null or
-        std.mem.indexOf(u8, buf, "\x1b[92;5:1u") != null;
-}
-
-fn sendHeartbeat(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
-    reliable_recv: *const transport.RecvState,
-    last_ack_send_ns: *i64,
-    ack_dirty: *bool,
-    now: i64,
-) !void {
-    var pkt_buf: [1200]u8 = undefined;
-    const pkt = try transport.buildUnreliable(
-        .heartbeat,
-        0,
-        reliable_recv.ack(),
-        reliable_recv.ackBits(),
-        "",
-        &pkt_buf,
-    );
-    try peer.send(sock, pkt);
-    last_ack_send_ns.* = now;
-    ack_dirty.* = false;
-}
-
-fn sendReliablePayload(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
-    reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
-    channel: transport.Channel,
-    payload: []const u8,
-    now: i64,
-) !void {
-    const packet = try reliable_send.buildAndTrack(
-        channel,
-        payload,
-        reliable_recv.ack(),
-        reliable_recv.ackBits(),
-        now,
-    );
-    peer.send(sock, packet) catch |err| {
-        if (err == error.NoPeerAddress or err == error.WouldBlock) return;
-        return err;
-    };
-}
-
-fn sendIpcReliable(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
-    reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
-    tag: ipc.Tag,
-    payload: []const u8,
-    now: i64,
-) !void {
-    if (payload.len <= max_ipc_payload) {
-        var buf: [transport.max_payload_len]u8 = undefined;
-        const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
-        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
-        return;
-    }
-
-    var off: usize = 0;
-    while (off < payload.len) {
-        const end = @min(off + max_ipc_payload, payload.len);
-        var buf: [transport.max_payload_len]u8 = undefined;
-        const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
-        try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
-        off = end;
-    }
-}
-
-fn requestResync(
-    peer: *udp_mod.Peer,
-    sock: *udp_mod.UdpSocket,
-    reliable_send: *transport.ReliableSend,
-    reliable_recv: *const transport.RecvState,
-    last_resync_request_ns: *i64,
-    now: i64,
-) !void {
-    if ((now - last_resync_request_ns.*) < resync_cooldown_ns) return;
-
-    var ctrl_buf: [8]u8 = undefined;
-    const payload = transport.buildControl(.resync_request, &ctrl_buf);
-    try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .control, payload, now);
-    last_resync_request_ns.* = now;
-}
-
-/// Remote attach: connect to a remote zmx session via UDP.
-pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
-    // Resolve host address — try numeric IP first, fall back to DNS
-    const addr = std.net.Address.resolveIp(session.host, session.port) catch blk: {
-        const list = try std.net.getAddressList(alloc, session.host, session.port);
-        defer list.deinit();
-        if (list.addrs.len == 0) return error.HostNotFound;
-        break :blk list.addrs[0];
-    };
-
-    // Create UDP socket — bind ephemeral port (OS picks)
-    const sock_fd = try posix.socket(
-        addr.any.family,
-        posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-        0,
-    );
-    var udp_sock = udp_mod.UdpSocket{ .fd = sock_fd, .bound_port = 0 };
-    defer udp_sock.close();
-
-    // Create peer
-    var peer = udp_mod.Peer.init(session.key, .to_server);
-    peer.addr = addr;
-
-    var reliable_send = try transport.ReliableSend.init(alloc);
-    defer reliable_send.deinit();
-    var reliable_recv = transport.RecvState{};
-    var output_recv = transport.OutputRecvState{};
-
-    // Set terminal to raw mode
-    var orig_termios: c.termios = undefined;
-    _ = c.tcgetattr(posix.STDIN_FILENO, &orig_termios);
-    defer {
-        _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSAFLUSH, &orig_termios);
-        const restore_seq = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" ++
-            "\x1b[?2004l\x1b[?1004l\x1b[?1049l" ++
-            // Restore pre-attach Kitty keyboard protocol mode so Ctrl combos
-            // return to legacy encoding in the user's outer shell.
-            "\x1b[<u" ++
-            "\x1b[?25h";
-        _ = posix.write(posix.STDOUT_FILENO, restore_seq) catch {};
-    }
-
-    var raw_termios = orig_termios;
-    c.cfmakeraw(&raw_termios);
-    raw_termios.c_cc[c.VLNEXT] = c._POSIX_VDISABLE;
-    raw_termios.c_cc[c.VQUIT] = c._POSIX_VDISABLE;
-    raw_termios.c_cc[c.VMIN] = 1;
-    raw_termios.c_cc[c.VTIME] = 0;
-    _ = c.tcsetattr(posix.STDIN_FILENO, c.TCSANOW, &raw_termios);
-
-    // Clear screen before attaching. We do NOT use the alternate screen
-    // (\x1b[?1049h) because it has no scrollback buffer.
-    _ = try posix.write(posix.STDOUT_FILENO, "\x1b[2J\x1b[H");
-
-    setupSigwinchHandler();
-
-    // Make stdin non-blocking
-    const stdin_flags = try posix.fcntl(posix.STDIN_FILENO, posix.F.GETFL, 0);
-    _ = try posix.fcntl(posix.STDIN_FILENO, posix.F.SETFL, stdin_flags | posix.SOCK.NONBLOCK);
-
-    const config = udp_mod.Config{};
-    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-    defer stdout_buf.deinit(alloc);
-    var was_disconnected = false;
-    var session_ended = false;
-
-    var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var ack_dirty = false;
-    var last_resync_request_ns: i64 = 0;
-
-    // Send Init message with terminal size (reliable)
-    const size = getTerminalSize();
-    var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
-    try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
+    var output: link_mod.Queue = .{};
+    defer output.deinit(alloc);
+    if (tty) try output.append(alloc, "\x1b[2J\x1b[H");
+    const initial_size = wire.encodeSize(zmx.ipc.getTerminalSize(0));
+    try link.enqueue(.Init, &initial_size);
+    var last_stdout = udp.nanoNow(io);
+    var detach_at: ?i64 = null;
+    var ended_at: ?i64 = null;
+    var input_closed = false;
+    var detach_key: DetachKey = .{};
+    const detach_enabled = p.getenv("ZMX_NO_DETACH_KEY") == null;
 
     while (true) {
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-
-        // Check SIGWINCH
-        if (sigwinch_received.swap(false, .acq_rel)) {
-            const new_size = getTerminalSize();
-            try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Resize, std.mem.asBytes(&new_size), now);
+        const now = udp.nanoNow(io);
+        if (runtime.stopped.load(.acquire) and detach_at == null and ended_at == null) {
+            try link.enqueue(.Detach, "");
+            detach_at = now;
+        }
+        if (runtime.resized.swap(false, .acq_rel) and detach_at == null and ended_at == null) {
+            const size = wire.encodeSize(zmx.ipc.getTerminalSize(0));
+            try link.enqueue(.Resize, &size);
         }
 
-        // Retransmit reliable packets based on adaptive RTO.
-        var retransmits = try reliable_send.collectRetransmits(alloc, now, peer.rto_us());
-        defer retransmits.deinit(alloc);
-        for (retransmits.items) |pkt| {
-            peer.send(&udp_sock, pkt) catch {};
+        // Ordered records remain in their receive slots until the stdout sink
+        // has retained capacity. ACK never requires an unbounded allocation.
+        while (link.recv.peek()) |payload| {
+            const msg = try wire.decode(payload);
+            switch (msg.tag) {
+                .Output => {
+                    if (ended_at != null) return error.OutputAfterSessionEnd;
+                    if (msg.data.len > output.room()) break;
+                    if (output.data().len == 0) last_stdout = now;
+                    try output.append(alloc, msg.data);
+                },
+                .SessionEnd => {
+                    ended_at = now;
+                    failure.set(msg.data);
+                },
+                else => return error.UnexpectedMessage,
+            }
+            link.recv.pop();
+        }
+        try tickLink(&link, now, ended_at);
+
+        if (output.data().len > 0 and now - last_stdout >= link_mod.progress_timeout_ns) return error.StdoutTimeout;
+        if (ended_at) |at| {
+            if (output.data().len == 0) {
+                // Keep ACKing duplicate terminal records briefly if the first
+                // ACK is lost; stdout has already drained completely.
+                if (now - at >= 250 * std.time.ns_per_ms) {
+                    if (failure.len > 0) return error.RemoteSessionFailed;
+                    return;
+                }
+            } else if (now - at >= link_mod.drain_timeout_ns) return error.IncompleteOutput;
+        }
+        if (detach_at) |at| {
+            if (ended_at == null and now - at >= link_mod.drain_timeout_ns) return error.DetachTimeout;
         }
 
-        // Ack heartbeat + keepalive heartbeat.
-        if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
-        } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+        if (detach_at == null and ended_at == null and detach_key.expired(now) and link.outgoing.room() >= wire.header_len + DetachKey.max_prefix) {
+            var pending: [DetachKey.max_prefix]u8 = undefined;
+            try link.enqueue(.Input, detach_key.flush(&pending));
         }
 
-        // State check
-        const state = peer.updateState(now, config);
-        if (state == .dead) {
-            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
-            return;
-        }
-        if (state == .disconnected and !was_disconnected) {
-            _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
-            was_disconnected = true;
-        } else if (state == .connected and was_disconnected) {
-            _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
-            was_disconnected = false;
-        }
-
-        // Build poll fds
-        var poll_fds: [3]posix.pollfd = undefined;
-        var poll_count: usize = 2;
-        poll_fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
-        poll_fds[1] = .{ .fd = udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
-        if (stdout_buf.items.len > 0) {
-            poll_fds[2] = .{ .fd = posix.STDOUT_FILENO, .events = posix.POLL.OUT, .revents = 0 };
-            poll_count = 3;
-        }
-
-        var poll_timeout: i64 = @min(@as(i64, config.heartbeat_interval_ms), 500);
-        if (reliable_send.hasPending()) {
-            const rto_ms = @divFloor(peer.rto_us(), 1000);
-            poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
-        }
-        if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
-
-        _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
-            if (err == error.Interrupted) continue;
-            return err;
+        var fds = [_]p.pollfd{
+            .{ .fd = link.socket.fd, .events = p.POLL.IN, .revents = 0 },
+            .{ .fd = if (!input_closed and detach_at == null and ended_at == null and link.outgoing.room() >= 4096) 0 else -1, .events = p.POLL.IN, .revents = 0 },
+            .{ .fd = if (output.data().len > 0) 1 else -1, .events = p.POLL.OUT, .revents = 0 },
+            .{ .fd = runtime.sig_pipe[0], .events = p.POLL.IN, .revents = 0 },
         };
-
-        // STDIN → reliable IPC over UDP
-        if (poll_fds[0].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
-            var input_raw: [4096]u8 = undefined;
-            const n_opt: ?usize = posix.read(posix.STDIN_FILENO, &input_raw) catch |err| blk: {
-                if (err == error.WouldBlock) break :blk null;
-                return err;
+        _ = try p.poll(&fds, 20);
+        if (fds[3].revents != 0) runtime.drainSignalPipe();
+        if (fds[0].revents & p.POLL.IN != 0) try link.receive(udp.nanoNow(io));
+        if (fds[2].revents & (p.POLL.HUP | p.POLL.ERR | p.POLL.NVAL) != 0) return error.StdoutClosed;
+        if (fds[2].revents & p.POLL.OUT != 0) {
+            const n = p.write(1, output.data()) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
             };
-            if (n_opt) |n| {
-                if (n > 0) {
-                    if (input_raw[0] == 0x1C or isKittyCtrlBackslash(input_raw[0..n])) {
-                        try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Detach, "", now);
-                        return;
-                    }
-                    try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Input, input_raw[0..n], now);
-                } else {
-                    return; // EOF on stdin
-                }
+            if (n > 0) {
+                output.consume(n);
+                last_stdout = udp.nanoNow(io);
             }
         }
-
-        // UDP recv → decode transport packets
-        if (poll_fds[1].revents & posix.POLL.IN != 0) {
-            while (true) {
-                var decrypt_buf: [9000]u8 = undefined;
-                const recv_result = try peer.recv(&udp_sock, &decrypt_buf);
-                const result = recv_result orelse break;
-
-                const packet = transport.parsePacket(result.data) catch continue;
-                reliable_send.ack(packet.ack, packet.ack_bits);
-
-                switch (packet.channel) {
-                    .heartbeat => {},
-                    .control => {
-                        ack_dirty = true;
-                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
-                    },
-                    .reliable_ipc => {
-                        ack_dirty = true;
-                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
-
-                        var offset: usize = 0;
-                        while (offset < packet.payload.len) {
-                            const remaining = packet.payload[offset..];
-                            const msg_len = ipc.expectedLength(remaining) orelse break;
-                            if (remaining.len < msg_len) break;
-
-                            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                            const payload = remaining[@sizeOf(ipc.Header)..msg_len];
-
-                            if (hdr.tag == .Output and payload.len > 0) {
-                                if (stdout_buf.items.len + payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, payload);
-                                }
-                            } else if (hdr.tag == .SessionEnd) {
-                                session_ended = true;
-                            }
-
-                            offset += msg_len;
-                        }
-                    },
-                    .output => {
-                        switch (output_recv.onPacket(packet.seq)) {
-                            .accept => {
-                                if (packet.payload.len == 0) continue;
-                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, packet.payload);
-                                }
-                            },
-                            .gap => {
-                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                            },
-                            .duplicate, .stale => {},
-                        }
-                    },
+        if (fds[1].revents & (p.POLL.IN | p.POLL.HUP) != 0) {
+            // Leave room to flush a prefix retained from the previous read.
+            var buf: [link_mod.chunk_size - DetachKey.max_prefix]u8 = undefined;
+            const n = p.read(0, &buf) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            var filtered: [link_mod.chunk_size]u8 = undefined;
+            if (n == 0) {
+                input_closed = true;
+                const pending = detach_key.flush(&filtered);
+                if (pending.len > 0) try link.enqueue(.Input, pending);
+                try link.enqueue(.Detach, "");
+                detach_at = now;
+            } else {
+                const result = detach_key.feed(buf[0..n], &filtered, detach_enabled, now);
+                if (result.input.len > 0) try link.enqueue(.Input, result.input);
+                if (result.detach) {
+                    try link.enqueue(.Detach, "");
+                    detach_at = now;
                 }
             }
-        }
-
-        // Flush stdout
-        if (poll_count == 3 and poll_fds[2].revents & posix.POLL.OUT != 0) {
-            if (stdout_buf.items.len > 0) {
-                const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
-                    if (err == error.WouldBlock) break :blk 0;
-                    return err;
-                };
-                if (written > 0) {
-                    try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
-                }
-            }
-        }
-
-        if (session_ended) {
-            if (stdout_buf.items.len > 0) {
-                _ = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch {};
-            }
-            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: remote session ended\r\n") catch {};
-            return;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Retain only a possible supported Kitty detach prefix between stdin reads.
+/// A lone Escape is released after a short idle interval rather than swallowed.
+const DetachKey = struct {
+    const sequences = [_][]const u8{ "\x1b[92;5u", "\x1b[92;5:1u" };
+    const max_prefix = sequences[1].len;
+    const timeout_ns = 100 * std.time.ns_per_ms;
+    pending: [max_prefix]u8 = undefined,
+    len: usize = 0,
+    last_byte: i64 = 0,
+    const Result = struct { input: []const u8, detach: bool };
 
-test "parseConnectLine valid" {
-    const result = try parseConnectLine("ZMX_CONNECT udp 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
-    try std.testing.expect(result.port == 60042);
+    fn flush(self: *DetachKey, out: []u8) []const u8 {
+        @memcpy(out[0..self.len], self.pending[0..self.len]);
+        const len = self.len;
+        self.len = 0;
+        return out[0..len];
+    }
+
+    fn expired(self: *const DetachKey, now: i64) bool {
+        return self.len > 0 and now - self.last_byte >= timeout_ns;
+    }
+
+    fn feed(self: *DetachKey, data: []const u8, out: []u8, enabled: bool, now: i64) Result {
+        std.debug.assert(out.len >= data.len + self.len);
+        var used: usize = 0;
+        if (!enabled) {
+            used = self.flush(out).len;
+            @memcpy(out[used..][0..data.len], data);
+            return .{ .input = out[0 .. used + data.len], .detach = false };
+        }
+        for (data) |byte| {
+            if (byte == 0x1c) {
+                used += self.flush(out[used..]).len;
+                return .{ .input = out[0..used], .detach = true };
+            }
+            self.pending[self.len] = byte;
+            self.len += 1;
+            while (self.len > 0) {
+                var is_prefix = false;
+                for (sequences) |sequence| {
+                    if (std.mem.eql(u8, self.pending[0..self.len], sequence)) {
+                        self.len = 0;
+                        return .{ .input = out[0..used], .detach = true };
+                    }
+                    if (std.mem.startsWith(u8, sequence, self.pending[0..self.len])) is_prefix = true;
+                }
+                if (is_prefix) break;
+                out[used] = self.pending[0];
+                used += 1;
+                self.len -= 1;
+                std.mem.copyForwards(u8, self.pending[0..self.len], self.pending[1..][0..self.len]);
+            }
+        }
+        self.last_byte = now;
+        return .{ .input = out[0..used], .detach = false };
+    }
+};
+
+const RemoteFailure = struct {
+    bytes: [96]u8 = undefined,
+    len: usize = 0,
+
+    fn set(self: *RemoteFailure, reason: []const u8) void {
+        self.len = @min(reason.len, self.bytes.len);
+        for (reason[0..self.len], self.bytes[0..self.len]) |byte, *dest| {
+            dest.* = if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') byte else '?';
+        }
+    }
+
+    fn report(self: *const RemoteFailure, fd: p.fd_t) void {
+        const flags = p.fcntl(fd, p.F.GETFL, 0) catch return;
+        _ = p.fcntl(fd, p.F.SETFL, flags | p.O_NONBLOCK) catch return;
+        defer _ = p.fcntl(fd, p.F.SETFL, flags) catch 0;
+        var buf: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "zmosh: remote failure: {s}\n", .{self.bytes[0..self.len]}) catch return;
+        _ = p.write(fd, message) catch 0;
+    }
+};
+
+test "detach matcher recognizes every split and preserves preceding bytes" {
+    for (DetachKey.sequences) |sequence| {
+        for (0..sequence.len + 1) |split| {
+            var matcher: DetachKey = .{};
+            var buf: [128]u8 = undefined;
+            const prefix = matcher.feed("abc", &buf, true, 0);
+            try std.testing.expectEqualStrings("abc", prefix.input);
+            const first = matcher.feed(sequence[0..split], &buf, true, 0);
+            try std.testing.expectEqualStrings("", first.input);
+            if (split == sequence.len) {
+                try std.testing.expect(first.detach);
+            } else {
+                try std.testing.expect(!first.detach);
+                const second = matcher.feed(sequence[split..], &buf, true, 1);
+                try std.testing.expect(second.detach);
+                try std.testing.expectEqualStrings("", second.input);
+            }
+        }
+    }
+    for (DetachKey.sequences) |sequence| {
+        var bytewise: DetachKey = .{};
+        var output: [128]u8 = undefined;
+        for (sequence, 0..) |byte, i| {
+            const result = bytewise.feed(&.{byte}, &output, true, @intCast(i));
+            try std.testing.expectEqual(i == sequence.len - 1, result.detach);
+            try std.testing.expectEqualStrings("", result.input);
+        }
+    }
+    var matcher: DetachKey = .{};
+    var buf: [128]u8 = undefined;
+    const preceding = matcher.feed("abc\x1cdiscard", &buf, true, 0);
+    try std.testing.expect(preceding.detach);
+    try std.testing.expectEqualStrings("abc", preceding.input);
+    _ = matcher.feed("\x1b[92;", &buf, true, 0);
+    const raw = matcher.feed("\x1cdiscard", &buf, true, 1);
+    try std.testing.expect(raw.detach);
+    try std.testing.expectEqualStrings("\x1b[92;", raw.input);
 }
 
-test "parseConnectLine invalid prefix" {
-    try std.testing.expectError(error.InvalidConnectLine, parseConnectLine("INVALID udp 60042 key\n"));
+test "detach matcher flushes mismatches and disabled sequences in exact order" {
+    const inputs = [_][]const u8{ "normal input", "\x1b[A", "\x1b[92;5:3u", "\x1b[92;6u", "\x1b\x1b[A" };
+    for (inputs) |input| {
+        for (0..input.len + 1) |split| {
+            var matcher: DetachKey = .{};
+            var buf: [128]u8 = undefined;
+            var collected: [128]u8 = undefined;
+            const first = matcher.feed(input[0..split], &buf, true, 0);
+            try std.testing.expect(!first.detach);
+            @memcpy(collected[0..first.input.len], first.input);
+            const used = first.input.len;
+            const second = matcher.feed(input[split..], &buf, true, 1);
+            try std.testing.expect(!second.detach);
+            @memcpy(collected[used..][0..second.input.len], second.input);
+            try std.testing.expectEqualStrings(input, collected[0 .. used + second.input.len]);
+        }
+    }
+    var matcher: DetachKey = .{};
+    var buf: [128]u8 = undefined;
+    const disabled = matcher.feed("abc\x1c\x1b[92;5u", &buf, false, 0);
+    try std.testing.expect(!disabled.detach);
+    try std.testing.expectEqualStrings("abc\x1c\x1b[92;5u", disabled.input);
 }
 
-test "parseConnectLine unsupported protocol" {
-    try std.testing.expectError(error.UnsupportedProtocol, parseConnectLine("ZMX_CONNECT tcp 60042 key\n"));
+test "detach prefix idle deadline and EOF flush preserve Escape" {
+    var matcher: DetachKey = .{};
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("", matcher.feed("\x1b", &buf, true, 10).input);
+    try std.testing.expect(!matcher.expired(10 + DetachKey.timeout_ns - 1));
+    try std.testing.expect(matcher.expired(10 + DetachKey.timeout_ns));
+    try std.testing.expectEqualStrings("\x1b", matcher.flush(&buf));
+    try std.testing.expect(!matcher.expired(10 + DetachKey.timeout_ns));
+    _ = matcher.feed("\x1b[92;", &buf, true, 20);
+    try std.testing.expectEqualStrings("\x1b[92;", matcher.flush(&buf));
+}
+
+test "remote failure reason is bounded and terminal safe" {
+    var failure: RemoteFailure = .{};
+    failure.set("NativeReadPauseTimeout");
+    try std.testing.expectEqualStrings("NativeReadPauseTimeout", failure.bytes[0..failure.len]);
+    failure.set("bad\x1b[2J\n\r\x00\xff");
+    try std.testing.expectEqualStrings("bad??2J????", failure.bytes[0..failure.len]);
+    failure.set(&(.{'x'} ** 200));
+    try std.testing.expectEqual(@as(usize, 96), failure.len);
+}
+
+test "remote failure diagnostic never blocks on full pipe and restores flags" {
+    const pipe = try p.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer p.close(pipe[0]);
+    defer p.close(pipe[1]);
+    const chunk = [_]u8{'x'} ** 4096;
+    while (true) {
+        _ = p.write(pipe[1], &chunk) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    const flags = try p.fcntl(pipe[1], p.F.GETFL, 0);
+    const blocking = flags & ~p.O_NONBLOCK;
+    _ = try p.fcntl(pipe[1], p.F.SETFL, blocking);
+    var failure: RemoteFailure = .{};
+    failure.set("NativeReadPauseTimeout");
+    failure.report(pipe[1]);
+    try std.testing.expectEqual(blocking, try p.fcntl(pipe[1], p.F.GETFL, 0));
+}
+
+fn tickLink(link: *link_mod.Link, now: i64, ended_at: ?i64) !void {
+    // Repeat retention ACKs during the existing terminal grace: the first
+    // ACK may be lost before the gateway's retransmission timer fires.
+    if (ended_at != null) link.ack_dirty = true;
+    try link.tick(now);
+}
+
+test "terminal ACK repeats within exit grace after first ACK is lost" {
+    const crypto = @import("crypto.zig");
+    const transport = @import("transport.zig");
+    const key = [_]u8{0x42} ** crypto.key_length;
+    var sink = try udp.UdpSocket.bind(61170, 61180);
+    defer sink.close();
+    const address = udp.Address.initIp4(.{ 127, 0, 0, 1 }, sink.bound_port);
+    var link = try link_mod.Link.init(std.testing.allocator, try udp.UdpSocket.bindClient(address), key, .to_server, 0);
+    defer link.deinit();
+    link.peer.addr = address;
+    var record: [wire.header_len]u8 = undefined;
+    _ = try link.recv.accept(1, try wire.encode(.SessionEnd, "", &record));
+    link.recv.pop();
+    link.ack_dirty = true;
+    try tickLink(&link, 20 * std.time.ns_per_ms, 0);
+    var raw: [1500]u8 = undefined;
+    _ = try sink.recvFrom(&raw); // Drop the first terminal ACK.
+    try tickLink(&link, 40 * std.time.ns_per_ms, 0);
+    const repeated = try sink.recvFrom(&raw);
+    var plain: [1500]u8 = undefined;
+    const decoded = try crypto.decodeDatagram(key, .to_server, raw[0..repeated.len], &plain);
+    const packet = try transport.parsePacket(decoded.plaintext);
+    try std.testing.expectEqual(transport.Channel.heartbeat, packet.channel);
+    try std.testing.expectEqual(@as(u32, 1), packet.ack);
+    try std.testing.expect(link.idle());
 }

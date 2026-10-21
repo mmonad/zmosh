@@ -1,3 +1,5 @@
+// Adapted from mmonad/zmosh, revision 71eba23416bfb443df755ad89d6d06e665ebcd95.
+// MIT license; see ../LICENSE and ../UPSTREAM.md.
 const std = @import("std");
 
 const log = std.log.scoped(.crypto);
@@ -22,9 +24,9 @@ pub const overhead = 8 + tag_length;
 
 // -- Key management ----------------------------------------------------------
 
-pub fn generateKey() Key {
+pub fn generateKey(io: std.Io) !Key {
     var key: Key = undefined;
-    std.crypto.random.bytes(&key);
+    try io.randomSecure(&key);
     return key;
 }
 
@@ -38,6 +40,7 @@ pub fn keyToBase64(key: Key) [encoded_key_len]u8 {
 }
 
 pub fn keyFromBase64(encoded: []const u8) !Key {
+    if ((base64.Decoder.calcSizeForSlice(encoded) catch return error.InvalidKey) != key_length) return error.InvalidKey;
     var key: Key = undefined;
     base64.Decoder.decode(&key, encoded) catch return error.InvalidKey;
     return key;
@@ -129,7 +132,7 @@ pub fn decodeDatagram(key: Key, expected_direction: Direction, datagram: []const
 // -- Tests -------------------------------------------------------------------
 
 test "round-trip encrypt/decrypt" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_server, 1);
     const plaintext = "hello, zmx!";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -141,7 +144,7 @@ test "round-trip encrypt/decrypt" {
 }
 
 test "tampered ciphertext fails authentication" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_client, 42);
     const plaintext = "secret";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -153,8 +156,8 @@ test "tampered ciphertext fails authentication" {
 }
 
 test "wrong key fails" {
-    const key = generateKey();
-    const wrong_key = generateKey();
+    const key = try generateKey(std.testing.io);
+    const wrong_key = try generateKey(std.testing.io);
     const nonce = buildNonce(.to_server, 0);
     const plaintext = "data";
     var ct_buf: [plaintext.len + tag_length]u8 = undefined;
@@ -176,14 +179,14 @@ test "nonce direction bit" {
 }
 
 test "base64 key round-trip" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const encoded = keyToBase64(key);
     const decoded = try keyFromBase64(&encoded);
     try std.testing.expectEqual(key, decoded);
 }
 
 test "datagram round-trip" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "payload data";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;
@@ -195,7 +198,7 @@ test "datagram round-trip" {
 }
 
 test "datagram direction mismatch" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "x";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;
@@ -205,7 +208,7 @@ test "datagram direction mismatch" {
 }
 
 test "datagram tamper fails" {
-    const key = generateKey();
+    const key = try generateKey(std.testing.io);
     const plaintext = "abc";
     var enc_buf: [overhead + plaintext.len]u8 = undefined;
     var dec_buf: [plaintext.len]u8 = undefined;
@@ -215,4 +218,33 @@ test "datagram tamper fails" {
     @memcpy(&tampered, datagram);
     tampered[10] ^= 0x01;
     try std.testing.expectError(error.AuthenticationFailed, decodeDatagram(key, .to_client, &tampered, &dec_buf));
+}
+
+test "key decoder rejects short decoded keys" {
+    try std.testing.expectError(error.InvalidKey, keyFromBase64("YQ=="));
+    try std.testing.expectError(error.InvalidKey, keyFromBase64(""));
+    try std.testing.expectError(error.InvalidKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+}
+
+// Captured by running the unmodified pinned upstream crypto.zig encoder at
+// 71eba23416bfb443df755ad89d6d06e665ebcd95 with key bytes 0..31 and seq below.
+test "pinned upstream datagram known answers in both directions" {
+    var key: Key = undefined;
+    for (&key, 0..) |*byte, i| byte.* = @intCast(i);
+    const plaintext = "zmosh pinned vector";
+    const vectors = [_][]const u8{
+        "0000000123456789b6cb064396d695e2d6eabf3293c2802ff80c2e1d35e34795571a1502595107bc8afa6b",
+        "800000012345678971943573dfbd6321964a1b7ffd5b94989fb6057aeb71c529bcbb8030954da8e0f0f1ca",
+    };
+    for (vectors, [_]Direction{ .to_server, .to_client }) |hex, direction| {
+        var expected: [overhead + plaintext.len]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected, hex);
+        var encrypted: [expected.len]u8 = undefined;
+        const packet = try encodeDatagram(key, direction, 0x123456789, plaintext, &encrypted);
+        try std.testing.expectEqualSlices(u8, &expected, packet);
+        var decoded: [plaintext.len]u8 = undefined;
+        const result = try decodeDatagram(key, direction, &expected, &decoded);
+        try std.testing.expectEqualStrings(plaintext, result.plaintext);
+        try std.testing.expectEqual(@as(u63, 0x123456789), result.seq);
+    }
 }
